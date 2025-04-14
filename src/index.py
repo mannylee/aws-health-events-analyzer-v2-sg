@@ -60,7 +60,7 @@ def lambda_handler(event, context):
         formatted_end = end_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
         
         # Initialize AWS Health client
-        health_client = boto3.client('health')
+        health_client = boto3.client('health', region_name='us-east-1')
         
         # Initialize variables for event collection
         all_events = []
@@ -373,7 +373,7 @@ def lambda_handler(event, context):
                             event_type = item.get('eventTypeCode', 'unknown')
                             print(f"Fetching affected accounts for event: {event_type}")
                             # Use the AWS Health API to get affected accounts
-                            health_client = boto3.client('health')
+                            health_client = boto3.client('health', region_name='us-east-1')
                             response = health_client.describe_affected_accounts_for_organization(
                             eventArn=event_arn
                             )
@@ -536,7 +536,7 @@ def is_org_view_enabled():
     """
     try:
         # Try to call an organization-specific API to check if it's enabled
-        health_client = boto3.client('health')
+        health_client = boto3.client('health', region_name='us-east-1')
         # This will throw an exception if org view is not enabled
         health_client.describe_events_for_organization(
             filter={},
@@ -595,7 +595,7 @@ def fetch_health_event_details(event_arn):
         dict: Event details including affected resources
     """
     try:
-        health_client = boto3.client('health')
+        health_client = boto3.client('health', region_name='us-east-1')
         
         # Get event details
         event_details = health_client.describe_event_details(
@@ -1721,7 +1721,7 @@ def fetch_health_event_details1(event_arn, account_id=None):
         dict: Event details including affected resources
     """
     try:
-        health_client = boto3.client('health')
+        health_client = boto3.client('health', region_name='us-east-1')
         
         # First try organization API (works for both current and linked accounts)
         try:
