@@ -27,6 +27,66 @@ S3_KEY_PREFIX = os.environ.get('S3_KEY_PREFIX', '')
 excluded_services = [s.strip() for s in excluded_services_str.split(',') if s.strip()]
 
 
+def expand_events_by_account(events):
+    """
+    Expands events that affect multiple accounts into separate event records for each account.
+    Fetches affected accounts if not already specified.
+    
+    Args:
+        events (list): List of event dictionaries
+        
+    Returns:
+        list: Expanded list of event dictionaries
+    """
+    expanded_events = []
+    health_client = boto3.client('health', region_name='us-east-1')
+    
+    for event in events:
+        # Get the account ID string which may contain multiple comma-separated IDs
+        account_id_str = event.get('accountId', '')
+        event_arn = event.get('arn', '')
+        
+        # If no account ID or it's N/A, try to fetch affected accounts
+        if not account_id_str or account_id_str == 'N/A':
+            try:
+                print(f"Fetching affected accounts for event: {event.get('eventTypeCode', 'unknown')}")
+                response = health_client.describe_affected_accounts_for_organization(
+                    eventArn=event_arn
+                )
+                affected_accounts = response.get('affectedAccounts', [])
+                
+                if affected_accounts:
+                    # If multiple accounts are affected, join them with commas
+                    account_id_str = ', '.join(affected_accounts)
+                    event['accountId'] = account_id_str  # Update the event with the account IDs
+                    print(f"Found affected accounts: {account_id_str}")
+                else:
+                    print("No affected accounts found")
+                    expanded_events.append(event)  # Keep the event as is
+                    continue
+            except Exception as e:
+                print(f"Error fetching affected accounts: {str(e)}")
+                expanded_events.append(event)  # Keep the event as is
+                continue
+        
+        # If no comma in the string, it's a single account or none
+        if ',' not in account_id_str:
+            expanded_events.append(event)
+            continue
+        
+        # Split the account IDs and create a separate event for each
+        account_ids = [aid.strip() for aid in account_id_str.split(',')]
+        print(f"Expanding event {event_arn} for {len(account_ids)} accounts: {account_ids}")
+        
+        for account_id in account_ids:
+            # Create a copy of the event for this specific account
+            account_event = event.copy()
+            account_event['accountId'] = account_id
+            expanded_events.append(account_event)
+    
+    print(f"Expanded {len(events)} events to {len(expanded_events)} account-specific events")
+    return expanded_events
+
 def lambda_handler(event, context):
     print("Starting execution...")
     
@@ -310,10 +370,15 @@ def lambda_handler(event, context):
             print(f"Filtered out {len(all_events) - len(filtered_events)} events from excluded services")
             all_events = filtered_events
         
-        items_count = len(all_events)
-        print(f"Fetched {items_count} unique events from AWS Health API")
+        # NEW STEP: Expand events for multiple accounts
+        all_events_original = all_events.copy()
+        all_events_expanded = expand_events_by_account(all_events)
+        print(f"Expanded {len(all_events_original)} events to {len(all_events_expanded)} account-specific events")
         
-        if items_count == 0:
+        items_count = len(all_events_original)  # Keep the original count for reporting
+        print(f"Fetched {items_count} unique events from AWS Health API (expanded to {len(all_events_expanded)} account-specific events)")
+        
+        if len(all_events_expanded) == 0:
             print("No events found with filter")
             return {
                 'statusCode': 200,
@@ -331,8 +396,8 @@ def lambda_handler(event, context):
         event_categories = defaultdict(int)
         raw_events = []  # Store raw event data for Excel
         
-        # Process each event from the API results
-        for item in all_events:
+        # Process each event from the expanded API results
+        for item in all_events_expanded:
             if context.get_remaining_time_in_millis() > 10000:
                 # Check if we should process this event category
                 event_type_category = item.get('eventTypeCategory', '')
@@ -355,51 +420,15 @@ def lambda_handler(event, context):
                     if event_arn:
                         item['eventArn'] = event_arn  # Standardize field name
                 
-                    # Extract account ID from ARN
-                    account_id = 'N/A'
-
-                    if 'accountId' in item:
-                        account_id = item.get('accountId')
-                    elif event_arn and ':' in event_arn:    
-                         arn_parts = event_arn.split(':')
-                         if len(arn_parts) >= 5:
-                            account_id = arn_parts[4]
-                            print(f"Event ARN: {event_arn}")
-                            print(f"ARN parts: {arn_parts if 'arn_parts' in locals() else 'Not defined'}")
-                            print(f"Extracted account ID: {account_id}")  # Account ID is typically the 5th part of an ARN
-                    if account_id == 'N/A' or not account_id:
-                        try:
-                            # Get the event type code for logging
-                            event_type = item.get('eventTypeCode', 'unknown')
-                            print(f"Fetching affected accounts for event: {event_type}")
-                            # Use the AWS Health API to get affected accounts
-                            health_client = boto3.client('health', region_name='us-east-1')
-                            response = health_client.describe_affected_accounts_for_organization(
-                            eventArn=event_arn
-                            )
-                            affected_accounts = response.get('affectedAccounts', [])
-
-                            if affected_accounts:
-                                 # If multiple accounts are affected, join them with commas
-                                account_id = ', '.join(affected_accounts)
-                                print(f"Found affected accounts: {account_id}")
-                            else:
-                                print("No affected accounts found")
-                        except Exception as e:
-                            print(f"Error fetching affected accounts: {str(e)}")
+                    # Extract account ID from ARN - this is already handled by the expansion function
+                    account_id = item.get('accountId', 'N/A')
+                    print(f"Processing with account ID: {account_id}")
                     
-                
-                    item['accountId'] = account_id  # Add account ID to the item
-                    print(f"Final account ID: {account_id}")
-
-    
-                    # Fetch additional details from Health API
-                    health_data = fetch_health_event_details1(item.get('arn', ''),account_id)
+                    # Fetch additional details from Health API - now with a single account ID
+                    health_data = fetch_health_event_details1(item.get('arn', ''), account_id)
                     
-                   
                     # Extract the actual description for analysis - IMPROVED EXTRACTION
                     actual_description = health_data['details'].get('eventDescription', {}).get('latestDescription', '')
-                    
                     
                     # If no description from Health API, try other possible fields
                     if not actual_description:
@@ -442,7 +471,7 @@ def lambda_handler(event, context):
                         "analysis_text": analysis,
                         "critical": categories.get('critical', False),
                         "risk_level": categories.get('risk_level', 'low'),
-                        "accountId": item.get('accountId', 'N/A'),  # Ensure accountId is included
+                        "accountId": account_id,  # Use the single account ID from the expanded event
                         "impact_analysis": categories.get('impact_analysis', ''),
                         "required_actions": categories.get('required_actions', ''),
                         "time_sensitivity": categories.get('time_sensitivity', 'Routine'),
@@ -468,7 +497,7 @@ def lambda_handler(event, context):
             
             # Generate summary HTML with filtering info
             summary_html = generate_summary_html(
-                items_count, 
+                items_count,  # Use original count before expansion
                 event_categories, 
                 filtered_count, 
                 event_categories_to_process if event_categories_to_process else None,
@@ -476,7 +505,7 @@ def lambda_handler(event, context):
             )
             
             # Send email with attachment
-            send_ses_email_with_attachment(summary_html, excel_buffer, items_count, event_categories,events_analysis)
+            send_ses_email_with_attachment(summary_html, excel_buffer, items_count, event_categories, events_analysis)
             
             try:
                 # Add CloudWatch metrics with error handling
@@ -488,7 +517,8 @@ def lambda_handler(event, context):
             return {
                 'statusCode': 200,
                 'body': json.dumps({
-                    'total_events': items_count,
+                    'total_events': items_count,  # Original event count
+                    'total_expanded_events': len(all_events_expanded),  # Expanded event count
                     'analyzed_events': len(events_analysis),
                     'filtered_events': filtered_count,
                     'categories': dict(event_categories),
@@ -507,6 +537,7 @@ def lambda_handler(event, context):
                 'body': json.dumps({
                     'message': 'Found events but none were analyzed',
                     'events_found': items_count,
+                    'expanded_events_found': len(all_events_expanded),
                     'filtered_events': filtered_count,
                     'category_filter_applied': bool(event_categories_to_process),
                     'categories_processed': event_categories_to_process,
@@ -557,7 +588,7 @@ def get_bedrock_client():
     Returns:
         boto3.client: Bedrock runtime client
     """
-    return boto3.client(service_name='bedrock-runtime')
+    return boto3.client(service_name='bedrock-runtime',region_name='us-east-1')
 
 def format_time(time_str):
     """
