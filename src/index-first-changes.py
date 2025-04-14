@@ -30,6 +30,7 @@ excluded_services = [s.strip() for s in excluded_services_str.split(',') if s.st
 def expand_events_by_account(events):
     """
     Expands events that affect multiple accounts into separate event records for each account.
+    Fetches affected accounts if not already specified.
     
     Args:
         events (list): List of event dictionaries
@@ -38,19 +39,44 @@ def expand_events_by_account(events):
         list: Expanded list of event dictionaries
     """
     expanded_events = []
+    health_client = boto3.client('health', region_name='us-east-1')
     
     for event in events:
         # Get the account ID string which may contain multiple comma-separated IDs
         account_id_str = event.get('accountId', '')
+        event_arn = event.get('arn', '')
         
-        # If no account ID or not a comma-separated string, keep the event as is
-        if not account_id_str or ',' not in account_id_str:
+        # If no account ID or it's N/A, try to fetch affected accounts
+        if not account_id_str or account_id_str == 'N/A':
+            try:
+                print(f"Fetching affected accounts for event: {event.get('eventTypeCode', 'unknown')}")
+                response = health_client.describe_affected_accounts_for_organization(
+                    eventArn=event_arn
+                )
+                affected_accounts = response.get('affectedAccounts', [])
+                
+                if affected_accounts:
+                    # If multiple accounts are affected, join them with commas
+                    account_id_str = ', '.join(affected_accounts)
+                    event['accountId'] = account_id_str  # Update the event with the account IDs
+                    print(f"Found affected accounts: {account_id_str}")
+                else:
+                    print("No affected accounts found")
+                    expanded_events.append(event)  # Keep the event as is
+                    continue
+            except Exception as e:
+                print(f"Error fetching affected accounts: {str(e)}")
+                expanded_events.append(event)  # Keep the event as is
+                continue
+        
+        # If no comma in the string, it's a single account or none
+        if ',' not in account_id_str:
             expanded_events.append(event)
             continue
         
         # Split the account IDs and create a separate event for each
         account_ids = [aid.strip() for aid in account_id_str.split(',')]
-        print(f"Expanding event {event.get('arn', 'unknown')} for {len(account_ids)} accounts")
+        print(f"Expanding event {event_arn} for {len(account_ids)} accounts: {account_ids}")
         
         for account_id in account_ids:
             # Create a copy of the event for this specific account
@@ -58,6 +84,7 @@ def expand_events_by_account(events):
             account_event['accountId'] = account_id
             expanded_events.append(account_event)
     
+    print(f"Expanded {len(events)} events to {len(expanded_events)} account-specific events")
     return expanded_events
 
 def lambda_handler(event, context):
