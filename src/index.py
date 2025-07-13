@@ -14,7 +14,7 @@ import os
 import uuid
 
 # Environment variables for configuration
-BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'anthropic.claude-3-sonnet-20240229-v1:0')
+BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'apac.anthropic.claude-3-sonnet-20240229-v1:0')
 BEDROCK_TEMPERATURE = float(os.environ.get('BEDROCK_TEMPERATURE', '0.1'))
 BEDROCK_TOP_P = float(os.environ.get('BEDROCK_TOP_P', '0.9'))
 BEDROCK_MAX_TOKENS = int(os.environ.get('BEDROCK_MAX_TOKENS', '4000'))
@@ -23,6 +23,7 @@ customer_name = os.environ.get('CUSTOMER_NAME', 'Notification')
 excluded_services_str = os.environ.get('EXCLUDED_SERVICES', '')
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME', '')
 S3_KEY_PREFIX = os.environ.get('S3_KEY_PREFIX', '')
+REPORTS_BUCKET = os.environ.get('REPORTS_BUCKET', '')
 
 excluded_services = [s.strip() for s in excluded_services_str.split(',') if s.strip()]
 
@@ -39,6 +40,8 @@ def expand_events_by_account(events):
         list: Expanded list of event dictionaries
     """
     expanded_events = []
+    
+    # Health API should go to us-east-1
     health_client = boto3.client('health', region_name='us-east-1')
     
     for event in events:
@@ -588,7 +591,8 @@ def get_bedrock_client():
     Returns:
         boto3.client: Bedrock runtime client
     """
-    return boto3.client(service_name='bedrock-runtime',region_name='us-east-1')
+    # Use ap-southeast-1 for Bedrock as Claude 3 Sonnet (SG)
+    return boto3.client(service_name='bedrock-runtime', region_name='ap-southeast-1')
 
 def format_time(time_str):
     """
@@ -626,6 +630,7 @@ def fetch_health_event_details(event_arn):
         dict: Event details including affected resources
     """
     try:
+        # Health API should go to us-east-1
         health_client = boto3.client('health', region_name='us-east-1')
         
         # Get event details
@@ -755,7 +760,7 @@ def analyze_event_with_bedrock(bedrock_client, event_data):
         """
         
         # Determine which model we're using and format accordingly
-        model_id = os.environ.get('BEDROCK_MODEL_ID', 'anthropic.claude-v2')
+        model_id = os.environ.get('BEDROCK_MODEL_ID', 'apac.anthropic.claude-3-sonnet-20240229-v1:0')
         max_tokens = int(os.environ.get('BEDROCK_MAX_TOKENS', '4000'))
         temperature = float(os.environ.get('BEDROCK_TEMPERATURE', '0.2'))
         top_p = float(os.environ.get('BEDROCK_TOP_P', '0.9'))
@@ -1582,29 +1587,34 @@ def send_ses_email_with_attachment(html_content, excel_buffer, total_events, eve
         traceback.print_exc()
     
     try:
-        # Check if S3 bucket name is configured
-        if not S3_BUCKET_NAME:
-            return False, "S3_BUCKET_NAME environment variable not configured"
+        # Determine which bucket to use - external or internal
+        bucket_name = S3_BUCKET_NAME if S3_BUCKET_NAME else REPORTS_BUCKET
+        
+        if not bucket_name:
+            return False, "No S3 bucket configured (neither S3_BUCKET_NAME nor REPORTS_BUCKET)"
             
         # Create S3 client
         s3_client = boto3.client('s3')
         
-        # Generate S3 key with prefix if provided
-        s3_key = f"{S3_KEY_PREFIX.rstrip('/')}/{excel_filename}" if S3_KEY_PREFIX else file_name
+        # Generate S3 key with prefix if provided (only for external bucket)
+        if S3_BUCKET_NAME:
+            s3_key = f"{S3_KEY_PREFIX.rstrip('/')}/{excel_filename}" if S3_KEY_PREFIX else excel_filename
+        else:
+            s3_key = excel_filename  # No prefix for internal bucket
         
         # Reset buffer position to the beginning
         excel_buffer.seek(0)
         
         # Upload buffer to S3 using put_object
         s3_client.put_object(
-            Bucket=S3_BUCKET_NAME,
+            Bucket=bucket_name,
             Key=s3_key,
             Body=excel_buffer.getvalue(),
             ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
         
         # Generate S3 URL for the uploaded file
-        s3_url = f"s3://{S3_BUCKET_NAME}/{s3_key}"
+        s3_url = f"s3://{bucket_name}/{s3_key}"
         
         print(f"Successfully uploaded file to {s3_url}")
              
@@ -1752,6 +1762,7 @@ def fetch_health_event_details1(event_arn, account_id=None):
         dict: Event details including affected resources
     """
     try:
+        # Health API should go to us-east-1
         health_client = boto3.client('health', region_name='us-east-1')
         
         # First try organization API (works for both current and linked accounts)
@@ -1827,21 +1838,26 @@ def upload_file_to_s3(file_path, file_name):
         tuple: (success boolean, S3 URL or error message)
     """
     try:
-        # Check if S3 bucket name is configured
-        if not S3_BUCKET_NAME:
-            return False, "S3_BUCKET_NAME environment variable not configured"
+        # Determine which bucket to use - external or internal
+        bucket_name = S3_BUCKET_NAME if S3_BUCKET_NAME else REPORTS_BUCKET
+        
+        if not bucket_name:
+            return False, "No S3 bucket configured (neither S3_BUCKET_NAME nor REPORTS_BUCKET)"
             
         # Create S3 client
         s3_client = boto3.client('s3')
         
-        # Generate S3 key with prefix if provided
-        s3_key = f"{S3_KEY_PREFIX.rstrip('/')}/{file_name}" if S3_KEY_PREFIX else file_name
+        # Generate S3 key with prefix if provided (only for external bucket)
+        if S3_BUCKET_NAME:
+            s3_key = f"{S3_KEY_PREFIX.rstrip('/')}/{file_name}" if S3_KEY_PREFIX else file_name
+        else:
+            s3_key = file_name  # No prefix for internal bucket
         
         # Upload file to S3
-        s3_client.upload_file(file_path, S3_BUCKET_NAME, s3_key)
+        s3_client.upload_file(file_path, bucket_name, s3_key)
         
         # Generate S3 URL for the uploaded file
-        s3_url = f"s3://{S3_BUCKET_NAME}/{s3_key}"
+        s3_url = f"s3://{bucket_name}/{s3_key}"
         
         print(f"Successfully uploaded file to {s3_url}")
         return True, s3_url
@@ -1850,11 +1866,3 @@ def upload_file_to_s3(file_path, file_name):
         error_message = f"Error uploading file to S3: {str(e)}"
         print(error_message)
         return False, error_message
-
-
-
-
-
-
-
-                
