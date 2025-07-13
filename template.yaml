@@ -175,7 +175,7 @@ Resources:
             except Exception as e:
                 cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
       Handler: index.handler
-      Runtime: python3.9
+      Runtime: python3.12
       Timeout: 30
 
   # S3 Bucket for temporary report storage with dynamic naming and 90-day lifecycle
@@ -202,7 +202,7 @@ Resources:
       FunctionName: !Sub 'aws-health-events-analyzer-${AWS::StackName}'
       Handler: index.lambda_handler
       Role: !GetAtt HealthEventsAnalyzerRole.Arn
-      Runtime: python3.9
+      Runtime: python3.12
       CodeUri: ./src/
       MemorySize: 2048
       Timeout: 900  # 15 minutes in seconds
@@ -222,7 +222,7 @@ Resources:
           S3_BUCKET_NAME: !Ref S3BucketName
           S3_KEY_PREFIX: !Ref S3KeyPrefix
           # Bedrock configuration
-          BEDROCK_MODEL_ID: anthropic.claude-3-sonnet-20240229-v1:0
+          BEDROCK_MODEL_ID: apac.anthropic.claude-3-sonnet-20240229-v1:0
           BEDROCK_MAX_TOKENS: 4000
           BEDROCK_TEMPERATURE: 0.3
           BEDROCK_TOP_P: !Ref BedrockTopP
