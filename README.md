@@ -20,7 +20,7 @@ A serverless solution that analyzes AWS Health events using Amazon Bedrock, cate
 3. Python 3.9 or later
 4. Verified email address in Amazon SES (for sending reports)
 5. Access to Amazon Bedrock and the Claude 3 Sonnet model
-6. Appropriate AWS Health API access (standard with AWS Support plans)
+6. **AWS Business or Enterprise Support plan** (required for AWS Health API access)
 7. **AWS Organizations enabled with AWS Health organizational view activated** (for organization-wide health events)
 8. (Optional) Existing S3 bucket for storing reports externally
 
@@ -30,8 +30,8 @@ A serverless solution that analyzes AWS Health events using Amazon Bedrock, cate
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/aws-health-events-analyzer.git
-cd aws-health-events-analyzer
+git clone https://github.com/mannylee/aws-health-events-analyzer-v2-sg.git
+cd aws-health-events-analyzer-v2-sg
 
 # Build the application
 sam build
@@ -51,8 +51,8 @@ During the guided deployment, you'll be prompted for:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/aws-health-events-analyzer.git
-cd aws-health-events-analyzer
+git clone https://github.com/mannylee/aws-health-events-analyzer-v2-sg.git
+cd aws-health-events-analyzer-v2-sg
 
 # Build the application
 sam build
@@ -118,7 +118,7 @@ version = 0.1
 stack_name = "health-events-analyzer-customer1"
 s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-EXAMPLE"
 s3_prefix = "health-events-analyzer-customer1"
-region = "us-east-1"
+region = "ap-southeast-1"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
 parameter_overrides = "SenderEmail=\"customer1@example.com\" RecipientEmails=\"recipient1@example.com\" S3BucketName=\"customer1-bucket\" S3KeyPrefix=\"health-reports\""
@@ -133,7 +133,7 @@ version = 0.1
 stack_name = "health-events-analyzer-customer2"
 s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-EXAMPLE"
 s3_prefix = "health-events-analyzer-customer2"
-region = "us-east-1"
+region = "ap-southeast-1"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
 parameter_overrides = "SenderEmail=\"customer2@example.com\" RecipientEmails=\"recipient2@example.com\" S3BucketName=\"customer2-bucket\" S3KeyPrefix=\"health-reports\""
@@ -160,10 +160,12 @@ parameter_overrides = "SenderEmail=\"customer2@example.com\" RecipientEmails=\"r
 ## Bedrock Configuration
 
 The Lambda function uses Amazon Bedrock with the following configuration:
-- Model: Claude 3 Sonnet (anthropic.claude-3-sonnet-20240229-v1:0)
+- Model: Claude 3 Sonnet via inference profile (`apac.anthropic.claude-3-sonnet-20240229-v1:0`)
 - Maximum Tokens: 4000
 - Temperature: 0.3
 - Top-P: 0.9 (configurable)
+
+**Note**: The solution uses Bedrock inference profiles. If deploying in a different region, you may need to update the model ID in the CloudFormation template to match the available inference profiles in that region.
 
 ## Architecture
 
@@ -199,14 +201,22 @@ The solution publishes the following CloudWatch metrics:
 
 - **No email received**: Verify SES email sending permissions and check if the sender email is verified
 - **Lambda timeout**: Check if you have many events to process; consider filtering by category or increasing the Lambda timeout
-- **Bedrock errors**: Ensure your account has access to the Claude 3 Sonnet model
-- **Missing events**: Verify your AWS Health API access and check the EventCategories filter
+- **Bedrock errors**: 
+  - Ensure your account has access to the Claude 3 Sonnet model
+  - Verify the correct inference profile ID is used for your region
+  - Check that inference profiles are enabled in your Bedrock console
+- **Missing events**: 
+  - Verify your AWS Health API access and check the EventCategories filter
+  - **Important**: AWS Health API requires Business or Enterprise Support plan
+  - Basic and Developer support plans do not have access to AWS Health API
 - **No organization events**: Ensure AWS Health organizational view is enabled in your AWS Organizations management account
 - **S3 upload failures**: 
-  - Check if the S3BucketName parameter is correctly specified
-  - Verify the bucket exists and the Lambda role has permissions to write to it
+  - If using external S3 bucket: Check if the S3BucketName parameter is correctly specified and the bucket exists
+  - If using internal bucket: The solution automatically creates and configures permissions for the internal bucket
+  - Verify the Lambda role has permissions to write to external buckets (internal bucket permissions are automatic)
   - Check CloudWatch Logs for specific error messages
   - For cross-account buckets, verify bucket policies allow access
+  - **Tip**: Leave S3BucketName empty to use the internal bucket with automatic permissions
 
 ## S3 Access Troubleshooting
 
