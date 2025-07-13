@@ -1,7 +1,7 @@
 import boto3
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from datetime import datetime, date
 from io import BytesIO
 from collections import defaultdict
@@ -14,7 +14,7 @@ import os
 import uuid
 
 # Environment variables for configuration
-BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'apac.anthropic.claude-3-sonnet-20240229-v1:0')
+BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'apac.anthropic.claude-3-5-sonnet-20241022-v2:0')
 BEDROCK_TEMPERATURE = float(os.environ.get('BEDROCK_TEMPERATURE', '0.1'))
 BEDROCK_TOP_P = float(os.environ.get('BEDROCK_TOP_P', '0.9'))
 BEDROCK_MAX_TOKENS = int(os.environ.get('BEDROCK_MAX_TOKENS', '4000'))
@@ -113,7 +113,7 @@ def lambda_handler(event, context):
         
         # Set up time range for filtering using environment variable
         bedrock_client = get_bedrock_client()
-        end_time = datetime.utcnow()
+        end_time = datetime.now(timezone.utc)
         start_time = end_time - timedelta(days=analysis_window_days)
         
         print(f"Fetching events between {start_time} and {end_time}")
@@ -827,7 +827,12 @@ def analyze_event_with_bedrock(bedrock_client, event_data):
             
             # Parse the JSON
             try:
-                analysis = json.loads(json_str)
+                # Clean the JSON string to handle control characters from Claude 3.5 Sonnet v2
+                cleaned_json = json_str.replace('\n', '\\n').replace('\t', '\\t').replace('\r', '\\r')
+                # print(f"Attempting to parse JSON: {cleaned_json[:500]}...")
+                analysis = json.loads(cleaned_json)
+                # print(f"Successfully parsed JSON: {analysis}")
+                
                 # NEW CODE: Normalize risk level to ensure consistency
                 if 'risk_level' in analysis:
                     risk_level = analysis['risk_level'].strip().upper()
@@ -852,20 +857,48 @@ def analyze_event_with_bedrock(bedrock_client, event_data):
                 event_data.update(analysis)
                 
                 return event_data
-            except json.JSONDecodeError:
-                print(f"Failed to parse JSON from response: {response_text[:200]}...")
-                # Provide default values if parsing fails
-                event_data.update({
-                    'critical': False,
-                    'risk_level': 'low',
-                    'account_impact': 'low',
-                    'time_sensitivity': 'Routine',
-                    'risk_category': 'Unknown',
-                    'required_actions': 'Review event details manually',
-                    'impact_analysis': 'Unable to automatically analyze this event',
-                    'consequences_if_ignored': 'Unknown',
-                    'affected_resources': 'Unknown'
-                })
+            except json.JSONDecodeError as e:
+                print(f"JSON parsing failed: {str(e)}")
+                print(f"Failed to parse JSON from response: {json_str[:500]}...")
+                print(f"Full response length: {len(response_text)}")
+                
+                # Try to manually extract key fields if JSON parsing fails
+                manual_analysis = {}
+                
+                # Extract critical status
+                if '"critical": false' in response_text.lower():
+                    manual_analysis['critical'] = False
+                elif '"critical": true' in response_text.lower():
+                    manual_analysis['critical'] = True
+                
+                # Extract risk level
+                risk_match = re.search(r'"risk_level":\s*"([^"]+)"', response_text, re.IGNORECASE)
+                if risk_match:
+                    manual_analysis['risk_level'] = risk_match.group(1).lower()
+                
+                # Extract other fields
+                for field in ['account_impact', 'time_sensitivity', 'risk_category', 'required_actions', 'impact_analysis', 'consequences_if_ignored', 'affected_resources']:
+                    field_match = re.search(f'"({field})":\s*"([^"]+)"', response_text, re.IGNORECASE)
+                    if field_match:
+                        manual_analysis[field] = field_match.group(2)
+                
+                if manual_analysis:
+                    print(f"Manually extracted fields: {manual_analysis}")
+                    event_data.update(manual_analysis)
+                else:
+                    # Provide default values if all parsing fails
+                    event_data.update({
+                        'critical': False,
+                        'risk_level': 'low',
+                        'account_impact': 'low',
+                        'time_sensitivity': 'Routine',
+                        'risk_category': 'Unknown',
+                        'required_actions': 'Review event details manually',
+                        'impact_analysis': 'Unable to automatically analyze this event',
+                        'consequences_if_ignored': 'Unknown',
+                        'affected_resources': 'Unknown'
+                    })
+                
                 return event_data
                 
         except Exception as e:
@@ -1394,7 +1427,7 @@ def generate_summary_html(total_events, event_categories, filtered_events, categ
     """
     
     # Add analysis window information
-    end_time = datetime.utcnow()
+    end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(days=int(os.environ['ANALYSIS_WINDOW_DAYS']))
     html_content += f"""
                 <p>Analysis Window: {start_time.strftime('%Y-%m-%d %H:%M:%S')} UTC to {end_time.strftime('%Y-%m-%d %H:%M:%S')} UTC</p>
