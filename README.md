@@ -178,6 +178,30 @@ The solution consists of:
 6. Integration with Amazon Bedrock for AI analysis
 7. Amazon SES for email delivery
 
+## AWS Resources Created
+
+### Lambda Functions
+- **HealthEventsAnalyzerFunction** - Main function that analyzes AWS Health events using Bedrock and sends email reports
+- **TimestampGeneratorFunction** - Custom resource function to generate unique timestamps for S3 bucket naming
+
+### Lambda Layer
+- **DependenciesLayer** - Contains Python dependencies for the main Lambda function
+
+### IAM Role
+- **HealthEventsAnalyzerRole** - Execution role with permissions for Bedrock, SES, Health API, Organizations, S3, and CloudWatch
+
+### S3 Bucket
+- **ReportsBucket** - Encrypted bucket for temporary report storage with 90-day lifecycle policy
+
+### EventBridge
+- **HealthEventsAnalyzerScheduleRule** - Triggers Lambda function every Tuesday at 5 PM UTC
+
+### Lambda Permission
+- **HealthEventsAnalyzerPermission** - Allows EventBridge to invoke the main Lambda function
+
+### Custom Resource
+- **TimestampGenerator** - CloudFormation custom resource for generating unique S3 bucket names
+
 ## Testing
 
 After deployment, you can manually invoke the Lambda function:
