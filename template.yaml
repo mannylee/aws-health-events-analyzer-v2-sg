@@ -72,10 +72,10 @@ Resources:
       Description: Dependencies for Health Events Analyzer
       ContentUri: ./layer
       CompatibleRuntimes:
-        - python3.9
+        - python3.12
       RetentionPolicy: Retain
     Metadata:
-      BuildMethod: python3.9
+      BuildMethod: python3.12
       BuildArchitecture: x86_64
       RequirementsPath: requirements.txt
 
@@ -175,7 +175,7 @@ Resources:
             except Exception as e:
                 cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
       Handler: index.handler
-      Runtime: python3.9
+      Runtime: python3.12
       Timeout: 30
 
   # S3 Bucket for temporary report storage with dynamic naming and 90-day lifecycle
@@ -202,7 +202,7 @@ Resources:
       FunctionName: !Sub 'aws-health-events-analyzer-${AWS::StackName}'
       Handler: index.lambda_handler
       Role: !GetAtt HealthEventsAnalyzerRole.Arn
-      Runtime: python3.9
+      Runtime: python3.12
       CodeUri: ./src/
       MemorySize: 2048
       Timeout: 900  # 15 minutes in seconds
