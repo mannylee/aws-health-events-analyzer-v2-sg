@@ -14,7 +14,7 @@ import os
 import uuid
 
 # Environment variables for configuration
-BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'apac.anthropic.claude-3-5-sonnet-20241022-v2:0')
+BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'anthropic.claude-3-5-sonnet-20240620-v1:0')
 BEDROCK_TEMPERATURE = float(os.environ.get('BEDROCK_TEMPERATURE', '0.1'))
 BEDROCK_TOP_P = float(os.environ.get('BEDROCK_TOP_P', '0.9'))
 BEDROCK_MAX_TOKENS = int(os.environ.get('BEDROCK_MAX_TOKENS', '4000'))
@@ -591,7 +591,7 @@ def get_bedrock_client():
     Returns:
         boto3.client: Bedrock runtime client
     """
-    # Use ap-southeast-1 for Bedrock as Claude 3 Sonnet (SG)
+    # Use ap-southeast-1 for Bedrock as Claude 3.5 Sonnet v1 is available in this region
     return boto3.client(service_name='bedrock-runtime', region_name='ap-southeast-1')
 
 def format_time(time_str):
@@ -760,7 +760,7 @@ def analyze_event_with_bedrock(bedrock_client, event_data):
         """
         
         # Determine which model we're using and format accordingly
-        model_id = os.environ.get('BEDROCK_MODEL_ID', 'apac.anthropic.claude-3-sonnet-20240229-v1:0')
+        model_id = os.environ.get('BEDROCK_MODEL_ID', 'anthropic.claude-3-5-sonnet-20240620-v1:0')
         max_tokens = int(os.environ.get('BEDROCK_MAX_TOKENS', '4000'))
         temperature = float(os.environ.get('BEDROCK_TEMPERATURE', '0.2'))
         top_p = float(os.environ.get('BEDROCK_TOP_P', '0.9'))
@@ -827,7 +827,7 @@ def analyze_event_with_bedrock(bedrock_client, event_data):
             
             # Parse the JSON
             try:
-                # Clean the JSON string to handle control characters from Claude 3.5 Sonnet v2
+                # Clean the JSON string to handle control characters from Claude 3.5 Sonnet v1
                 cleaned_json = json_str.replace('\n', '\\n').replace('\t', '\\t').replace('\r', '\\r')
                 # print(f"Attempting to parse JSON: {cleaned_json[:500]}...")
                 analysis = json.loads(cleaned_json)
