@@ -160,7 +160,7 @@ parameter_overrides = "SenderEmail=\"customer2@example.com\" RecipientEmails=\"r
 ## Bedrock Configuration
 
 The Lambda function uses Amazon Bedrock with the following configuration:
-- Model: Claude 3.5 Sonnet v2 via inference profile (`apac.anthropic.claude-3-5-sonnet-20241022-v2:0`)
+- Model: Claude 3.5 Sonnet v1 (`anthropic.claude-3-5-sonnet-20240620-v1:0`)
 - Maximum Tokens: 4000
 - Temperature: 0.3
 - Top-P: 0.9 (configurable)
