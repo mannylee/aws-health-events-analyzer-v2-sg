@@ -222,7 +222,7 @@ Resources:
           S3_BUCKET_NAME: !Ref S3BucketName
           S3_KEY_PREFIX: !Ref S3KeyPrefix
           # Bedrock configuration
-          BEDROCK_MODEL_ID: apac.anthropic.claude-3-5-sonnet-20241022-v2:0
+          BEDROCK_MODEL_ID: anthropic.claude-3-5-sonnet-20240620-v1:0
           BEDROCK_MAX_TOKENS: 4000
           BEDROCK_TEMPERATURE: 0.3
           BEDROCK_TOP_P: !Ref BedrockTopP
