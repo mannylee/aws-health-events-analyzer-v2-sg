@@ -20,12 +20,12 @@ Parameters:
     
   EventCategories:
     Type: String
-    Description: Optional comma-separated list of event categories to filter
+    Description: (Optional) Comma-separated list of event categories to filter
     Default: 'accountNotification'
     
   ExcludedServices:
     Type: String
-    Description: Optional comma-separated list of services to exclude from analysis
+    Description: (Optional) Comma-separated list of services to exclude from analysis
     Default: ''
     
   ExcelFilenameTemplate:
@@ -41,7 +41,7 @@ Parameters:
     
   CustomerName:
     Type: String
-    Description: Customer name for report customization (optional)
+    Description: (Optional) Customer name for report customization
     Default: ''
     
   BedrockTopP:
@@ -54,13 +54,25 @@ Parameters:
   # S3 bucket name parameter with empty default
   S3BucketName:
     Type: String
-    Description: Name of the S3 bucket to store health events analysis
+    Description: (Optional) Name of the S3 bucket to store health events analysis
     Default: ''
     
   # S3 key prefix parameter with empty default
   S3KeyPrefix:
     Type: String
-    Description: Prefix for S3 objects in the bucket
+    Description: (Optional) Prefix for S3 objects in the bucket
+    Default: ''
+    
+  # Account email mapping parameter
+  AccountEmailMapping:
+    Type: String
+    Description: (Optional) Mapping of AWS account IDs to email addresses (format = account1:email1@example.com,account2:email2@example.com)
+    Default: ''
+    
+  # S3 health events override parameter (for testing only)
+  OverrideS3HealthEventsArn:
+    Type: String
+    Description: '(Optional) Health events analyser will analyse a file on S3 instead of using the Health API'
     Default: ''
 
 Resources:
@@ -226,6 +238,10 @@ Resources:
           BEDROCK_MAX_TOKENS: 4000
           BEDROCK_TEMPERATURE: 0.3
           BEDROCK_TOP_P: !Ref BedrockTopP
+          # Account email mapping
+          ACCOUNT_EMAIL_MAPPING: !Ref AccountEmailMapping
+          # S3 health events override (for testing)
+          OVERRIDE_S3_HEALTH_EVENTS_ARN: !Ref OverrideS3HealthEventsArn
 
   # EventBridge Rule for scheduled execution - Run every Tuesday at 5 PM UTC
   HealthEventsAnalyzerScheduleRule:
