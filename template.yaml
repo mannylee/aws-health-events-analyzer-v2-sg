@@ -118,6 +118,7 @@ Resources:
                   - bedrock-runtime:InvokeModel
                   - ses:SendEmail
                   - ses:SendRawEmail
+                  - ses:GetIdentityVerificationAttributes
                   - cloudwatch:PutMetricData
                   - health:DescribeEvents
                   - health:DescribeEventDetails
