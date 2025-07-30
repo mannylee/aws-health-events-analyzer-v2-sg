@@ -1,11 +1,13 @@
 import boto3
 import json
 import re
+import csv
+import ast
 from datetime import datetime, timedelta, timezone
 from datetime import datetime, date
 from io import BytesIO
 from collections import defaultdict
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from botocore.exceptions import ClientError
 import base64
@@ -24,8 +26,46 @@ excluded_services_str = os.environ.get('EXCLUDED_SERVICES', '')
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME', '')
 S3_KEY_PREFIX = os.environ.get('S3_KEY_PREFIX', '')
 REPORTS_BUCKET = os.environ.get('REPORTS_BUCKET', '')
+ACCOUNT_EMAIL_MAPPING = os.environ.get('ACCOUNT_EMAIL_MAPPING', '')
+OVERRIDE_S3_HEALTH_EVENTS_ARN = os.environ.get('OVERRIDE_S3_HEALTH_EVENTS_ARN', '')
 
 excluded_services = [s.strip() for s in excluded_services_str.split(',') if s.strip()]
+
+
+def parse_account_email_mapping():
+    """
+    Parse the ACCOUNT_EMAIL_MAPPING environment variable into two dictionaries.
+    Expected format: "account1:email1@example.com,account2:email2@example.com"
+    
+    Returns:
+        tuple: (account_to_email_mapping, email_to_accounts_mapping)
+            - account_to_email_mapping: dict mapping account IDs to email addresses
+            - email_to_accounts_mapping: dict mapping email addresses to lists of account IDs
+    """
+    account_to_email = {}
+    email_to_accounts = defaultdict(list)
+    
+    if ACCOUNT_EMAIL_MAPPING:
+        try:
+            pairs = [pair.strip() for pair in ACCOUNT_EMAIL_MAPPING.split(',') if pair.strip()]
+            for pair in pairs:
+                if ':' in pair:
+                    account_id, email = pair.split(':', 1)
+                    account_id = account_id.strip()
+                    email = email.strip()
+                    
+                    account_to_email[account_id] = email
+                    email_to_accounts[email].append(account_id)
+                    print(f"Account mapping: {account_id} -> {email}")
+        except Exception as e:
+            print(f"Error parsing ACCOUNT_EMAIL_MAPPING: {str(e)}")
+    
+    print(f"Parsed {len(account_to_email)} account email mappings")
+    print(f"Found {len(email_to_accounts)} unique email addresses")
+    for email, accounts in email_to_accounts.items():
+        print(f"Email {email} will receive events for accounts: {', '.join(accounts)}")
+    
+    return account_to_email, dict(email_to_accounts)
 
 
 def expand_events_by_account(events):
@@ -90,6 +130,359 @@ def expand_events_by_account(events):
     print(f"Expanded {len(events)} events to {len(expanded_events)} account-specific events")
     return expanded_events
 
+
+def download_s3_file(s3_location):
+    """
+    Download file from S3 location (supports both CSV and Excel files)
+    
+    Args:
+        s3_location (str): S3 location in format s3://bucket/key or bucket/key
+        
+    Returns:
+        BytesIO: File content as BytesIO object
+    """
+    try:
+        # Parse S3 location
+        if s3_location.startswith('s3://'):
+            s3_location = s3_location[5:]  # Remove s3:// prefix
+        
+        parts = s3_location.split('/', 1)
+        if len(parts) != 2:
+            raise ValueError(f"Invalid S3 location format: {s3_location}")
+        
+        bucket_name, key = parts
+        
+        print(f"Downloading file from S3: bucket={bucket_name}, key={key}")
+        
+        # Create S3 client
+        s3_client = boto3.client('s3')
+        
+        # Download file to BytesIO
+        file_buffer = BytesIO()
+        s3_client.download_fileobj(bucket_name, key, file_buffer)
+        file_buffer.seek(0)
+        
+        print(f"Successfully downloaded file from S3")
+        return file_buffer, key
+        
+    except Exception as e:
+        print(f"Error downloading file from S3: {str(e)}")
+        raise
+
+
+def parse_health_events_file(file_buffer, filename):
+    """
+    Parse CSV or Excel file containing health events and convert to Health API format
+    
+    Args:
+        file_buffer (BytesIO): File content
+        filename (str): Name of the file to determine format
+        
+    Returns:
+        list: List of health events in Health API format
+    """
+    try:
+        # Determine file type from extension
+        is_csv = filename.lower().endswith('.csv')
+        
+        if is_csv:
+            print("Parsing CSV file for health events...")
+            return parse_csv_health_events(file_buffer)
+        else:
+            print("Parsing Excel file for health events...")
+            return parse_excel_health_events(file_buffer)
+        
+    except Exception as e:
+        print(f"Error parsing health events file: {str(e)}")
+        traceback.print_exc()
+        raise
+
+
+def parse_csv_health_events(csv_buffer):
+    """
+    Parse CSV file containing health events and convert to Health API format
+    
+    Args:
+        csv_buffer (BytesIO): CSV file content
+        
+    Returns:
+        list: List of health events in Health API format
+    """
+    import csv
+    import ast
+    
+    try:
+        print("Parsing CSV file for health events...")
+        
+        # Read CSV content
+        csv_buffer.seek(0)
+        csv_content = csv_buffer.read().decode('utf-8-sig')  # Handle BOM if present
+        csv_reader = csv.DictReader(csv_content.splitlines())
+        
+        # Map CSV column names to Health API field names based on your actual CSV structure
+        column_mapping = {
+            'domain': 'domain',  # Keep domain for reference
+            'account_id': 'accountId',
+            'event_arn': 'arn',
+            'event_type_code': 'eventTypeCode',
+            'event_type_category': 'eventTypeCategory',
+            'service': 'service',
+            'region': 'region',
+            'availability_zone': 'availabilityZone',
+            'start_time': 'startTime',
+            'end_time': 'endTime',
+            'last_updated_time': 'lastUpdatedTime',
+            'status_code': 'statusCode',
+            'event_scope_code': 'eventScopeCode',
+            'affected_entities_count': 'affectedEntitiesCount',
+            'affected_entities': 'affectedEntities',
+            'details': 'details'  # Special handling - extracts description only
+        }
+        
+        print(f"CSV headers found: {list(csv_reader.fieldnames)}")
+        
+        # Validate that we have the expected columns
+        expected_columns = ['account_id', 'event_arn', 'event_type_code', 'service']
+        missing_columns = [col for col in expected_columns if col not in csv_reader.fieldnames]
+        if missing_columns:
+            print(f"Warning: Missing expected columns: {missing_columns}")
+        
+        # Parse events from CSV rows
+        events = []
+        for row_num, row in enumerate(csv_reader, start=2):
+            if not any(row.values()):  # Skip empty rows
+                continue
+                
+            event = {}
+            
+            # Extract fields based on mapping
+            for csv_col, api_field in column_mapping.items():
+                if csv_col in row and row[csv_col] is not None:
+                    value = str(row[csv_col]).strip()
+                    if not value:  # Skip empty values
+                        continue
+                    
+                    # Handle special fields that need parsing
+                    if csv_col == 'details' and value:
+                        try:
+                            # Parse the details field which contains a dictionary as string
+                            details_dict = ast.literal_eval(value)
+                            if isinstance(details_dict, dict):
+                                # Extract description from details - this is the main field we need
+                                if 'description' in details_dict:
+                                    event['eventDescription'] = details_dict['description']
+                                # Also extract affected_entities if present in details and not already set
+                                if 'affected_entities' in details_dict and 'affectedEntities' not in event:
+                                    event['affectedEntities'] = details_dict['affected_entities']
+                                # Don't store the full details blob to keep data size manageable
+                        except (ValueError, SyntaxError) as e:
+                            print(f"Warning: Could not parse details field for row {row_num}: {e}")
+                            # Try to extract at least the description if it's a simple string
+                            if 'description' in value.lower():
+                                event['eventDescription'] = value[:1000] + "..." if len(value) > 1000 else value
+                            else:
+                                event['eventDescription'] = value[:500] + "..." if len(value) > 500 else value
+                    elif csv_col == 'affected_entities' and value:
+                        try:
+                            # This might be a string representation of a list or just a string
+                            if value.startswith('[') or value.startswith('arn:'):
+                                event[api_field] = value
+                            else:
+                                event[api_field] = value
+                        except Exception as e:
+                            print(f"Warning: Could not parse affected_entities for row {row_num}: {e}")
+                            event[api_field] = value
+                    elif csv_col == 'affected_entities_count' and value:
+                        try:
+                            # Convert to integer
+                            event[api_field] = int(value)
+                        except ValueError:
+                            print(f"Warning: Could not convert affected_entities_count to int for row {row_num}: {value}")
+                            event[api_field] = value
+                    else:
+                        event[api_field] = value
+            
+            # Set default values for required fields if missing
+            if 'arn' not in event:
+                event['arn'] = f"arn:aws:health:global::event/csv-event-{row_num}"
+            
+            if 'eventTypeCode' not in event:
+                event['eventTypeCode'] = 'UNKNOWN_EVENT_TYPE'
+            
+            if 'service' not in event:
+                event['service'] = 'unknown'
+            
+            if 'region' not in event:
+                event['region'] = 'global'
+            
+            if 'statusCode' not in event:
+                event['statusCode'] = 'closed'
+            
+            if 'eventTypeCategory' not in event:
+                event['eventTypeCategory'] = 'accountNotification'
+            
+            # Handle datetime fields - they should already be in ISO format from your CSV
+            current_time = datetime.now(timezone.utc).isoformat()
+            if 'startTime' not in event:
+                event['startTime'] = current_time
+            
+            if 'lastUpdatedTime' not in event:
+                event['lastUpdatedTime'] = current_time
+            
+            # Ensure accountId is set
+            if 'accountId' not in event:
+                event['accountId'] = '123456789012'  # Default test account
+            
+            events.append(event)
+            
+        print(f"Parsed {len(events)} events from CSV file")
+        
+        # Log first event for debugging
+        if events:
+            print(f"Sample event: {json.dumps(events[0], indent=2, default=str)}")
+        
+        return events
+        
+    except Exception as e:
+        print(f"Error parsing CSV file: {str(e)}")
+        traceback.print_exc()
+        raise
+
+
+def parse_excel_health_events(excel_buffer):
+    """
+    Parse Excel file containing health events and convert to Health API format
+    
+    Args:
+        excel_buffer (BytesIO): Excel file content
+        
+    Returns:
+        list: List of health events in Health API format
+    """
+    try:
+        print("Parsing Excel file for health events...")
+        
+        # Load the workbook
+        workbook = load_workbook(excel_buffer, data_only=True)
+        
+        # Try to find the worksheet with health events data
+        # Common sheet names to look for
+        sheet_names_to_try = ['Sheet1', 'Events', 'Health Events', 'AWS Health Events']
+        worksheet = None
+        
+        for sheet_name in sheet_names_to_try:
+            if sheet_name in workbook.sheetnames:
+                worksheet = workbook[sheet_name]
+                break
+        
+        if worksheet is None:
+            # Use the first sheet if no common names found
+            worksheet = workbook.active
+            print(f"Using worksheet: {worksheet.title}")
+        else:
+            print(f"Found worksheet: {worksheet.title}")
+        
+        # Read the header row to understand the structure
+        headers = []
+        for cell in worksheet[1]:
+            if cell.value:
+                headers.append(str(cell.value).strip())
+            else:
+                headers.append('')
+        
+        print(f"Excel headers found: {headers}")
+        
+        # Map common Excel column names to Health API field names
+        column_mapping = {
+            'Event ARN': 'arn',
+            'Event Type': 'eventTypeCode',
+            'Event Type Code': 'eventTypeCode',
+            'Service': 'service',
+            'Region': 'region',
+            'Start Time': 'startTime',
+            'End Time': 'endTime',
+            'Last Update Time': 'lastUpdatedTime',
+            'Status': 'statusCode',
+            'Event Status': 'statusCode',
+            'Category': 'eventTypeCategory',
+            'Event Category': 'eventTypeCategory',
+            'Event Type Category': 'eventTypeCategory',
+            'Description': 'eventDescription',
+            'Event Description': 'eventDescription',
+            'Account ID': 'accountId',
+            'Account': 'accountId',
+            'Affected Account': 'accountId'
+        }
+        
+        # Create field index mapping
+        field_indices = {}
+        for i, header in enumerate(headers):
+            if header in column_mapping:
+                field_indices[column_mapping[header]] = i
+                print(f"Mapped column '{header}' to field '{column_mapping[header]}' at index {i}")
+        
+        # Parse events from rows
+        events = []
+        for row_num, row in enumerate(worksheet.iter_rows(min_row=2, values_only=True), start=2):
+            if not any(row):  # Skip empty rows
+                continue
+                
+            event = {}
+            
+            # Extract fields based on mapping
+            for field, index in field_indices.items():
+                if index < len(row) and row[index] is not None:
+                    value = str(row[index]).strip()
+                    if value:
+                        event[field] = value
+            
+            # Set default values for required fields if missing
+            if 'arn' not in event:
+                event['arn'] = f"arn:aws:health:global::event/test-event-{row_num}"
+            
+            if 'eventTypeCode' not in event:
+                event['eventTypeCode'] = 'UNKNOWN_EVENT_TYPE'
+            
+            if 'service' not in event:
+                event['service'] = 'unknown'
+            
+            if 'region' not in event:
+                event['region'] = 'global'
+            
+            if 'statusCode' not in event:
+                event['statusCode'] = 'closed'
+            
+            if 'eventTypeCategory' not in event:
+                event['eventTypeCategory'] = 'accountNotification'
+            
+            # Handle datetime fields
+            current_time = datetime.now(timezone.utc).isoformat()
+            if 'startTime' not in event:
+                event['startTime'] = current_time
+            
+            if 'lastUpdatedTime' not in event:
+                event['lastUpdatedTime'] = current_time
+            
+            # Ensure accountId is set
+            if 'accountId' not in event:
+                event['accountId'] = '123456789012'  # Default test account
+            
+            events.append(event)
+            
+        print(f"Parsed {len(events)} events from Excel file")
+        
+        # Log first event for debugging
+        if events:
+            print(f"Sample event: {json.dumps(events[0], indent=2)}")
+        
+        return events
+        
+    except Exception as e:
+        print(f"Error parsing Excel file: {str(e)}")
+        traceback.print_exc()
+        raise
+
+
 def lambda_handler(event, context):
     print("Starting execution...")
     
@@ -118,245 +511,268 @@ def lambda_handler(event, context):
         
         print(f"Fetching events between {start_time} and {end_time}")
         
-        # Format dates properly for the API
-        formatted_start = start_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-        formatted_end = end_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-        
-        # Initialize AWS Health client
-        health_client = boto3.client('health', region_name='us-east-1')
-        
-        # Initialize variables for event collection
-        all_events = []
-        filtered_count = 0
-        
-        try:
-            # Check if we should use organization view or account view
-            use_org_view = is_org_view_enabled()
+        # Check if we should use S3 health events instead of Health API
+        if OVERRIDE_S3_HEALTH_EVENTS_ARN:
+            print(f"OVERRIDE_S3_HEALTH_EVENTS_ARN is set to: {OVERRIDE_S3_HEALTH_EVENTS_ARN}")
+            print("Using S3 file for health events instead of Health API")
             
-            if use_org_view:
-                print("Using AWS Health Organization View")
+            try:
+                # Download and parse file from S3 (CSV or Excel)
+                file_buffer, filename = download_s3_file(OVERRIDE_S3_HEALTH_EVENTS_ARN)
+                all_events = parse_health_events_file(file_buffer, filename)
+                filtered_count = 0
                 
-                # CHANGE 1: Fetch closed events with both start and end date filters
-                closed_filter = {
-                    'startTime': {'from': formatted_start},
-                    'endTime': {'to': formatted_end},
-                    'eventStatusCodes': ['closed', 'upcoming']
+                print(f"Successfully loaded {len(all_events)} events from S3 file")
+                
+            except Exception as e:
+                print(f"Error processing S3 file: {str(e)}")
+                traceback.print_exc()
+                return {
+                    'statusCode': 500,
+                    'body': json.dumps({'error': f'Failed to process S3 file: {str(e)}'})
                 }
+        else:
+            print("Using AWS Health API for events")
+            
+            # Format dates properly for the API
+            formatted_start = start_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+            formatted_end = end_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+            
+            # Initialize AWS Health client
+            health_client = boto3.client('health', region_name='us-east-1')
+            
+            # Initialize variables for event collection
+            all_events = []
+            filtered_count = 0
+            
+            try:
+                # Check if we should use organization view or account view
+                use_org_view = is_org_view_enabled()
                 
-                # Add event type categories filter if specified
-                if event_categories_to_process:
-                    closed_filter['eventTypeCategories'] = event_categories_to_process
+                if use_org_view:
+                    print("Using AWS Health Organization View")
                 
-                print(f"Fetching CLOSED events with filter: {closed_filter}")
-                closed_response = health_client.describe_events_for_organization(
-                    filter=closed_filter,
-                    maxResults=100
-                )
-                
-                if 'events' in closed_response:
-                    all_events.extend(closed_response['events'])
-                    print(f"Retrieved {len(closed_response.get('events', []))} closed events")
-                
-                # Handle pagination for closed events
-                while 'nextToken' in closed_response and closed_response['nextToken']:
-                    print(f"Found nextToken for closed events, fetching more...")
-                    if context.get_remaining_time_in_millis() < 15000:  # 15 seconds buffer
-                        print("Approaching Lambda timeout, stopping pagination")
-                        break
-                        
+                    # CHANGE 1: Fetch closed events with both start and end date filters
+                    closed_filter = {
+                        'startTime': {'from': formatted_start},
+                        'endTime': {'to': formatted_end},
+                        'eventStatusCodes': ['closed', 'upcoming']
+                    }
+                    
+                    # Add event type categories filter if specified
+                    if event_categories_to_process:
+                        closed_filter['eventTypeCategories'] = event_categories_to_process
+                    
+                    print(f"Fetching CLOSED events with filter: {closed_filter}")
                     closed_response = health_client.describe_events_for_organization(
                         filter=closed_filter,
-                        maxResults=100,
-                        nextToken=closed_response['nextToken']
+                        maxResults=100
                     )
                     
                     if 'events' in closed_response:
                         all_events.extend(closed_response['events'])
-                        print(f"Retrieved {len(closed_response.get('events', []))} additional closed events")
-                
-                # CHANGE 2: Fetch open events with only start date filter
-                open_filter = {
-                    'startTime': {'from': formatted_start},  # Started on or after start date
-                    'eventStatusCodes': ['open']  # Only open events
-                }
-                
-                # Add event type categories filter if specified
-                if event_categories_to_process:
-                    open_filter['eventTypeCategories'] = event_categories_to_process
-                
-                print(f"Fetching OPEN events with filter: {open_filter}")
-                open_response = health_client.describe_events_for_organization(
-                    filter=open_filter,
-                    maxResults=100
-                )
-                
-                if 'events' in open_response:
-                    all_events.extend(open_response['events'])
-                    print(f"Retrieved {len(open_response.get('events', []))} open events")
-                
-                # Handle pagination for open events
-                while 'nextToken' in open_response and open_response['nextToken']:
-                    print(f"Found nextToken for open events, fetching more...")
-                    if context.get_remaining_time_in_millis() < 15000:  # 15 seconds buffer
-                        print("Approaching Lambda timeout, stopping pagination")
-                        break
+                        print(f"Retrieved {len(closed_response.get('events', []))} closed events")
+                    
+                    # Handle pagination for closed events
+                    while 'nextToken' in closed_response and closed_response['nextToken']:
+                        print(f"Found nextToken for closed events, fetching more...")
+                        if context.get_remaining_time_in_millis() < 15000:  # 15 seconds buffer
+                            print("Approaching Lambda timeout, stopping pagination")
+                            break
+                            
+                        closed_response = health_client.describe_events_for_organization(
+                            filter=closed_filter,
+                            maxResults=100,
+                            nextToken=closed_response['nextToken']
+                        )
                         
+                        if 'events' in closed_response:
+                            all_events.extend(closed_response['events'])
+                            print(f"Retrieved {len(closed_response.get('events', []))} additional closed events")
+                    
+                    # CHANGE 2: Fetch open events with only start date filter
+                    open_filter = {
+                        'startTime': {'from': formatted_start},  # Started on or after start date
+                        'eventStatusCodes': ['open']  # Only open events
+                    }
+                    
+                    # Add event type categories filter if specified
+                    if event_categories_to_process:
+                        open_filter['eventTypeCategories'] = event_categories_to_process
+                    
+                    print(f"Fetching OPEN events with filter: {open_filter}")
                     open_response = health_client.describe_events_for_organization(
                         filter=open_filter,
-                        maxResults=100,
-                        nextToken=open_response['nextToken']
+                        maxResults=100
                     )
                     
                     if 'events' in open_response:
                         all_events.extend(open_response['events'])
-                        print(f"Retrieved {len(open_response.get('events', []))} additional open events")
-                
-            else:
-                print("Using AWS Health Account View")
-                
-                # CHANGE 3: Same approach for account view - fetch closed events
-                closed_filter = {
-                    'startTime': {'from': formatted_start},
-                    'endTime': {'to': formatted_end},
-                    'eventStatusCodes': ['closed', 'upcoming']
-                }
-                
-                # Add event type categories filter if specified
-                if event_categories_to_process:
-                    closed_filter['eventTypeCategories'] = event_categories_to_process
-                
-                print(f"Fetching CLOSED events with filter: {closed_filter}")
-                closed_response = health_client.describe_events(
-                    filter=closed_filter,
-                    maxResults=100
-                )
-                
-                if 'events' in closed_response:
-                    all_events.extend(closed_response['events'])
-                
-                # Handle pagination for closed events
-                while 'nextToken' in closed_response and closed_response['nextToken']:
-                    if context.get_remaining_time_in_millis() < 15000:  # 15 seconds buffer
-                        print("Approaching Lambda timeout, stopping pagination")
-                        break
+                        print(f"Retrieved {len(open_response.get('events', []))} open events")
+                    
+                    # Handle pagination for open events
+                    while 'nextToken' in open_response and open_response['nextToken']:
+                        print(f"Found nextToken for open events, fetching more...")
+                        if context.get_remaining_time_in_millis() < 15000:  # 15 seconds buffer
+                            print("Approaching Lambda timeout, stopping pagination")
+                            break
+                            
+                        open_response = health_client.describe_events_for_organization(
+                            filter=open_filter,
+                            maxResults=100,
+                            nextToken=open_response['nextToken']
+                        )
                         
+                        if 'events' in open_response:
+                            all_events.extend(open_response['events'])
+                            print(f"Retrieved {len(open_response.get('events', []))} additional open events")
+                
+                else:
+                    print("Using AWS Health Account View")
+                    
+                    # CHANGE 3: Same approach for account view - fetch closed events
+                    closed_filter = {
+                        'startTime': {'from': formatted_start},
+                        'endTime': {'to': formatted_end},
+                        'eventStatusCodes': ['closed', 'upcoming']
+                    }
+                    
+                    # Add event type categories filter if specified
+                    if event_categories_to_process:
+                        closed_filter['eventTypeCategories'] = event_categories_to_process
+                    
+                    print(f"Fetching CLOSED events with filter: {closed_filter}")
                     closed_response = health_client.describe_events(
                         filter=closed_filter,
-                        maxResults=100,
-                        nextToken=closed_response['nextToken']
+                        maxResults=100
                     )
                     
                     if 'events' in closed_response:
                         all_events.extend(closed_response['events'])
-                
-                # CHANGE 4: Fetch open events with only start date filter
-                open_filter = {
-                    'startTime': {'from': formatted_start},  # Started on or after start date
-                    'eventStatusCodes': ['open']  # Only open events
-                }
-                
-                # Add event type categories filter if specified
-                if event_categories_to_process:
-                    open_filter['eventTypeCategories'] = event_categories_to_process
-                
-                print(f"Fetching OPEN events with filter: {open_filter}")
-                open_response = health_client.describe_events(
-                    filter=open_filter,
-                    maxResults=100
-                )
-                
-                if 'events' in open_response:
-                    all_events.extend(open_response['events'])
-                
-                # Handle pagination for open events
-                while 'nextToken' in open_response and open_response['nextToken']:
-                    if context.get_remaining_time_in_millis() < 15000:  # 15 seconds buffer
-                        print("Approaching Lambda timeout, stopping pagination")
-                        break
+                    
+                    # Handle pagination for closed events
+                    while 'nextToken' in closed_response and closed_response['nextToken']:
+                        if context.get_remaining_time_in_millis() < 15000:  # 15 seconds buffer
+                            print("Approaching Lambda timeout, stopping pagination")
+                            break
+                            
+                        closed_response = health_client.describe_events(
+                            filter=closed_filter,
+                            maxResults=100,
+                            nextToken=closed_response['nextToken']
+                        )
                         
+                        if 'events' in closed_response:
+                            all_events.extend(closed_response['events'])
+                    
+                    # CHANGE 4: Fetch open events with only start date filter
+                    open_filter = {
+                        'startTime': {'from': formatted_start},  # Started on or after start date
+                        'eventStatusCodes': ['open']  # Only open events
+                    }
+                    
+                    # Add event type categories filter if specified
+                    if event_categories_to_process:
+                        open_filter['eventTypeCategories'] = event_categories_to_process
+                    
+                    print(f"Fetching OPEN events with filter: {open_filter}")
                     open_response = health_client.describe_events(
                         filter=open_filter,
-                        maxResults=100,
-                        nextToken=open_response['nextToken']
+                        maxResults=100
                     )
                     
                     if 'events' in open_response:
                         all_events.extend(open_response['events'])
+                    
+                    # Handle pagination for open events
+                    while 'nextToken' in open_response and open_response['nextToken']:
+                        if context.get_remaining_time_in_millis() < 15000:  # 15 seconds buffer
+                            print("Approaching Lambda timeout, stopping pagination")
+                            break
+                            
+                        open_response = health_client.describe_events(
+                            filter=open_filter,
+                            maxResults=100,
+                            nextToken=open_response['nextToken']
+                        )
+                        
+                        if 'events' in open_response:
+                            all_events.extend(open_response['events'])
         
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'SubscriptionRequiredException':
-                print("Health Organization View is not enabled. Falling back to account-specific view.")
-                
-                # CHANGE 5: Same approach for fallback - fetch closed events
-                closed_filter = {
-                    'startTime': {'from': formatted_start},
-                    'endTime': {'to': formatted_end},
-                    'eventStatusCodes': ['closed', 'upcoming']
-                }
-                
-                # Add event type categories filter if specified
-                if event_categories_to_process:
-                    closed_filter['eventTypeCategories'] = event_categories_to_process
-                
-                print(f"Fetching CLOSED events with filter: {closed_filter}")
-                closed_response = health_client.describe_events(
-                    filter=closed_filter,
-                    maxResults=100
-                )
-                
-                if 'events' in closed_response:
-                    all_events.extend(closed_response['events'])
-                
-                # Handle pagination for closed events
-                while 'nextToken' in closed_response and closed_response['nextToken']:
-                    if context.get_remaining_time_in_millis() < 15000:  # 15 seconds buffer
-                        print("Approaching Lambda timeout, stopping pagination")
-                        break
-                        
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'SubscriptionRequiredException':
+                    print("Health Organization View is not enabled. Falling back to account-specific view.")
+                    
+                    # CHANGE 5: Same approach for fallback - fetch closed events
+                    closed_filter = {
+                        'startTime': {'from': formatted_start},
+                        'endTime': {'to': formatted_end},
+                        'eventStatusCodes': ['closed', 'upcoming']
+                    }
+                    
+                    # Add event type categories filter if specified
+                    if event_categories_to_process:
+                        closed_filter['eventTypeCategories'] = event_categories_to_process
+                    
+                    print(f"Fetching CLOSED events with filter: {closed_filter}")
                     closed_response = health_client.describe_events(
                         filter=closed_filter,
-                        maxResults=100,
-                        nextToken=closed_response['nextToken']
+                        maxResults=100
                     )
                     
                     if 'events' in closed_response:
                         all_events.extend(closed_response['events'])
-                
-                # CHANGE 6: Fetch open events with only start date filter
-                open_filter = {
-                    'startTime': {'from': formatted_start},  # Started on or after start date
-                    'eventStatusCodes': ['open']  # Only open events
-                }
-                
-                # Add event type categories filter if specified
-                if event_categories_to_process:
-                    open_filter['eventTypeCategories'] = event_categories_to_process
-                
-                print(f"Fetching OPEN events with filter: {open_filter}")
-                open_response = health_client.describe_events(
-                    filter=open_filter,
-                    maxResults=100
-                )
-                
-                if 'events' in open_response:
-                    all_events.extend(open_response['events'])
-                
-                # Handle pagination for open events
-                while 'nextToken' in open_response and open_response['nextToken']:
-                    if context.get_remaining_time_in_millis() < 15000:  # 15 seconds buffer
-                        print("Approaching Lambda timeout, stopping pagination")
-                        break
+                    
+                    # Handle pagination for closed events
+                    while 'nextToken' in closed_response and closed_response['nextToken']:
+                        if context.get_remaining_time_in_millis() < 15000:  # 15 seconds buffer
+                            print("Approaching Lambda timeout, stopping pagination")
+                            break
+                            
+                        closed_response = health_client.describe_events(
+                            filter=closed_filter,
+                            maxResults=100,
+                            nextToken=closed_response['nextToken']
+                        )
                         
+                        if 'events' in closed_response:
+                            all_events.extend(closed_response['events'])
+                    
+                    # CHANGE 6: Fetch open events with only start date filter
+                    open_filter = {
+                        'startTime': {'from': formatted_start},  # Started on or after start date
+                        'eventStatusCodes': ['open']  # Only open events
+                    }
+                    
+                    # Add event type categories filter if specified
+                    if event_categories_to_process:
+                        open_filter['eventTypeCategories'] = event_categories_to_process
+                    
+                    print(f"Fetching OPEN events with filter: {open_filter}")
                     open_response = health_client.describe_events(
                         filter=open_filter,
-                        maxResults=100,
-                        nextToken=open_response['nextToken']
+                        maxResults=100
                     )
                     
                     if 'events' in open_response:
                         all_events.extend(open_response['events'])
-            else:
-                raise
+                    
+                    # Handle pagination for open events
+                    while 'nextToken' in open_response and open_response['nextToken']:
+                        if context.get_remaining_time_in_millis() < 15000:  # 15 seconds buffer
+                            print("Approaching Lambda timeout, stopping pagination")
+                            break
+                            
+                        open_response = health_client.describe_events(
+                            filter=open_filter,
+                            maxResults=100,
+                            nextToken=open_response['nextToken']
+                        )
+                        
+                        if 'events' in open_response:
+                            all_events.extend(open_response['events'])
+                else:
+                    raise
         
         # CHANGE 7: Remove duplicates by ARN
         unique_events = {}
@@ -480,7 +896,8 @@ def lambda_handler(event, context):
                         "time_sensitivity": categories.get('time_sensitivity', 'Routine'),
                         "risk_category": categories.get('risk_category', 'Unknown'),
                         "consequences_if_ignored": categories.get('consequences_if_ignored', ''),
-                        "affected_resources": extract_affected_resources(health_data['entities'])
+                        "affected_resources": extract_affected_resources(health_data['entities']),
+                        "key_date": categories.get('key_date', 'N/A')
                     }
                     
                     events_analysis.append(event_entry)
@@ -507,8 +924,8 @@ def lambda_handler(event, context):
                 events_analysis  
             )
             
-            # Send email with attachment
-            send_ses_email_with_attachment(summary_html, excel_buffer, items_count, event_categories, events_analysis)
+            # Send emails with account-specific logic
+            send_account_specific_emails(events_analysis, items_count, event_categories, filtered_count, event_categories_to_process)
             
             try:
                 # Add CloudWatch metrics with error handling
@@ -742,7 +1159,8 @@ def analyze_event_with_bedrock(bedrock_client, event_data):
           "required_actions": "string",
           "impact_analysis": "string",
           "consequences_if_ignored": "string",
-          "affected_resources": "string"
+          "affected_resources": "string",
+          "key_date": "YYYY-MM-DD or null"
         }}
         
         IMPORTANT: In your impact_analysis field, be very specific about:
@@ -751,6 +1169,13 @@ def analyze_event_with_bedrock(bedrock_client, event_data):
         3. Whether this will cause downtime if actions are not taken
         
         In your consequences_if_ignored field, clearly state what outages or disruptions will occur if the event is not addressed.
+        
+        For the key_date field:
+        - Analyze the event description for any dates that customers need to be aware of
+        - Look for dates when actions must be taken, when changes will occur, or when impacts will begin
+        - Return the EARLIEST date that will impact the customer in YYYY-MM-DD format
+        - If no specific date is mentioned or can be determined, return null
+        - Common date patterns to look for: deadlines, maintenance windows, deprecation dates, end-of-life dates, migration deadlines
 
         RISK LEVEL GUIDELINES:
         - CRITICAL: Will cause service outage or severe disruption if not addressed
@@ -959,7 +1384,8 @@ def categorize_analysis(analysis_text):
         'time_sensitivity': 'Routine',
         'risk_category': 'Unknown',
         'consequences_if_ignored': '',
-        'event_category': 'Low'
+        'event_category': 'Low',
+        'key_date': 'N/A'
     }
     
     try:
@@ -1114,6 +1540,7 @@ def create_excel_report_improved(events_analysis):
         "Critical", 
         "Risk Level", 
         "Account ID", 
+        "Key Date",  # Added Key Date column
         "Time Sensitivity", 
         "Risk Category", 
         "Required Actions", 
@@ -1146,29 +1573,30 @@ def create_excel_report_improved(events_analysis):
         events_sheet.cell(row=row_num, column=8).value = "Yes" if event.get('critical', False) else "No"
         events_sheet.cell(row=row_num, column=9).value = event.get('risk_level', 'low').upper()
         events_sheet.cell(row=row_num, column=10).value = event.get('accountId', 'N/A')
-        events_sheet.cell(row=row_num, column=11).value = event.get('time_sensitivity', 'Routine')
-        events_sheet.cell(row=row_num, column=12).value = event.get('risk_category', 'Unknown')
-        events_sheet.cell(row=row_num, column=13).value = event.get('required_actions', '')
-        events_sheet.cell(row=row_num, column=14).value = event.get('impact_analysis', '')
-        events_sheet.cell(row=row_num, column=15).value = event.get('consequences_if_ignored', '')
-        events_sheet.cell(row=row_num, column=16).value = event.get('affected_resources', 'None')
+        events_sheet.cell(row=row_num, column=11).value = event.get('key_date', 'N/A')
+        events_sheet.cell(row=row_num, column=12).value = event.get('time_sensitivity', 'Routine')
+        events_sheet.cell(row=row_num, column=13).value = event.get('risk_category', 'Unknown')
+        events_sheet.cell(row=row_num, column=14).value = event.get('required_actions', '')
+        events_sheet.cell(row=row_num, column=15).value = event.get('impact_analysis', '')
+        events_sheet.cell(row=row_num, column=16).value = event.get('consequences_if_ignored', '')
+        events_sheet.cell(row=row_num, column=17).value = event.get('affected_resources', 'None')
         
         # Color coding based on risk level
         risk_level = event.get('risk_level', 'low').lower()
         is_critical = event.get('critical', False)
         
         if is_critical:
-            for col_num in range(1, 17):
+            for col_num in range(1, 18):
                 events_sheet.cell(row=row_num, column=col_num).fill = PatternFill(
                     start_color="FFCCCC", end_color="FFCCCC", fill_type="solid"
                 )
         elif risk_level == 'high':
-            for col_num in range(1, 17):
+            for col_num in range(1, 18):
                 events_sheet.cell(row=row_num, column=col_num).fill = PatternFill(
                     start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"
                 )
         elif risk_level == 'medium':
-            for col_num in range(1, 17):
+            for col_num in range(1, 18):
                 events_sheet.cell(row=row_num, column=col_num).fill = PatternFill(
                     start_color="E6F2FF", end_color="E6F2FF", fill_type="solid"
                 )
@@ -1204,7 +1632,7 @@ def create_excel_report_improved(events_analysis):
     critical_events = [event for event in events_analysis if event.get('critical', False)]
     if not critical_events:
         critical_sheet.cell(row=2, column=1).value = "No critical events found"
-        critical_sheet.merge_cells('A2:P2')  # Updated to include new columns
+        critical_sheet.merge_cells('A2:Q2')  # Updated to include new columns
         critical_sheet.cell(row=2, column=1).alignment = Alignment(horizontal='center')
     else:
         for row_num, event in enumerate(critical_events, 2):
@@ -1224,15 +1652,16 @@ def create_excel_report_improved(events_analysis):
             critical_sheet.cell(row=row_num, column=8).value = "Yes"
             critical_sheet.cell(row=row_num, column=9).value = event.get('risk_level', 'low').upper()
             critical_sheet.cell(row=row_num, column=10).value = event.get('accountId', 'N/A')
-            critical_sheet.cell(row=row_num, column=11).value = event.get('time_sensitivity', 'Routine')
-            critical_sheet.cell(row=row_num, column=12).value = event.get('risk_category', 'Unknown')
-            critical_sheet.cell(row=row_num, column=13).value = event.get('required_actions', '')
-            critical_sheet.cell(row=row_num, column=14).value = event.get('impact_analysis', '')
-            critical_sheet.cell(row=row_num, column=15).value = event.get('consequences_if_ignored', '')
-            critical_sheet.cell(row=row_num, column=16).value = event.get('affected_resources', 'None')
+            critical_sheet.cell(row=row_num, column=11).value = event.get('key_date', 'N/A')
+            critical_sheet.cell(row=row_num, column=12).value = event.get('time_sensitivity', 'Routine')
+            critical_sheet.cell(row=row_num, column=13).value = event.get('risk_category', 'Unknown')
+            critical_sheet.cell(row=row_num, column=14).value = event.get('required_actions', '')
+            critical_sheet.cell(row=row_num, column=15).value = event.get('impact_analysis', '')
+            critical_sheet.cell(row=row_num, column=16).value = event.get('consequences_if_ignored', '')
+            critical_sheet.cell(row=row_num, column=17).value = event.get('affected_resources', 'None')
             
             # Apply critical highlighting
-            for col_num in range(1, 17):
+            for col_num in range(1, 18):
                 critical_sheet.cell(row=row_num, column=col_num).fill = PatternFill(
                     start_color="FFCCCC", end_color="FFCCCC", fill_type="solid"
                 )
@@ -1337,7 +1766,7 @@ def create_excel_report_improved(events_analysis):
     
     return excel_buffer
 
-def generate_summary_html(total_events, event_categories, filtered_events, category_filter, events_analysis):
+def generate_summary_html(total_events, event_categories, filtered_events, category_filter, events_analysis, accounts_processed=None):
     """
     Generate HTML summary for email
     
@@ -1347,6 +1776,7 @@ def generate_summary_html(total_events, event_categories, filtered_events, categ
         filtered_events (int): Number of filtered events
         category_filter (list): Categories used for filtering
         events_analysis (list): Analyzed events data
+        accounts_processed (str, optional): Comma-separated string of account IDs being processed
         
     Returns:
         str: HTML content for email
@@ -1425,6 +1855,12 @@ def generate_summary_html(total_events, event_categories, filtered_events, categ
                 <h2>Summary</h2>
                 <p>Total AWS Health events analyzed: {len(events_analysis)} of {total_events} events found</p>
     """
+    
+    # Add accounts processed information if provided
+    if accounts_processed:
+        html_content += f"""
+                <p><strong>Accounts processed:</strong> {accounts_processed}</p>
+        """
     
     # Add analysis window information
     end_time = datetime.now(timezone.utc)
@@ -1539,6 +1975,884 @@ def generate_summary_html(total_events, event_categories, filtered_events, categ
     """
     
     return html_content
+
+
+def send_account_specific_emails(events_analysis, items_count, event_categories, filtered_count, event_categories_to_process):
+    """
+    Send emails grouped by recipient email address based on ACCOUNT_EMAIL_MAPPING, 
+    with SES failure handling and master email with tracking columns.
+    
+    Args:
+        events_analysis (list): List of analyzed events
+        items_count (int): Total number of original events
+        event_categories (dict): Event categories count
+        filtered_count (int): Number of filtered events
+        event_categories_to_process (list): Categories that were processed
+        
+    Returns:
+        None
+    """
+    try:
+        # Parse account email mapping - returns both mappings
+        account_to_email, email_to_accounts = parse_account_email_mapping()
+        
+        # Initialize tracking for email sending results
+        email_sending_results = {}  # email -> (success, error_message)
+        events_for_default_email = []  # Events that need to go to default email
+        
+        # Add tracking columns to all events
+        for event in events_analysis:
+            account_id = event.get('accountId', 'N/A')
+            if account_id in account_to_email:
+                event['mapped_email'] = account_to_email[account_id]
+                event['email_sent_status'] = 'Pending'
+            else:
+                event['mapped_email'] = 'No mapping'
+                event['email_sent_status'] = 'Sent to default'
+        
+        if not account_to_email:
+            # No account-specific mapping, send all events to default email
+            print("No account email mapping found, sending all events to default email")
+            # Update all events status
+            for event in events_analysis:
+                event['email_sent_status'] = 'Sent to default'
+            
+            excel_buffer = create_excel_report_improved_with_tracking(events_analysis)
+            summary_html = generate_summary_html(
+                items_count, event_categories, filtered_count, 
+                event_categories_to_process, events_analysis
+            )
+            send_ses_email_with_attachment(summary_html, excel_buffer, items_count, event_categories, events_analysis)
+            return
+        
+        # Group events by email address (not account ID)
+        events_by_email = defaultdict(list)
+        unmapped_events = []
+        
+        for event in events_analysis:
+            account_id = event.get('accountId', 'N/A')
+            if account_id in account_to_email:
+                email = account_to_email[account_id]
+                events_by_email[email].append(event)
+            else:
+                unmapped_events.append(event)
+                event['email_sent_status'] = 'Sent to default'
+        
+        print(f"Grouped events by email: {len(events_by_email)} unique email addresses, {len(unmapped_events)} unmapped events")
+        
+        # Send emails grouped by recipient email address with SES error handling
+        for email, email_events in events_by_email.items():
+            try:
+                # Get the accounts that map to this email
+                accounts_for_email = email_to_accounts[email]
+                accounts_str = ', '.join(accounts_for_email)
+                
+                print(f"Attempting to send email to {email} for accounts [{accounts_str}] with {len(email_events)} events")
+                
+                # Create Excel report for all events going to this email
+                excel_buffer = create_excel_report_improved(email_events)
+                
+                # Calculate event categories for this email's events
+                email_event_categories = defaultdict(int)
+                for event in email_events:
+                    if event.get('critical', False):
+                        email_event_categories['critical'] += 1
+                    
+                    risk_level = event.get('risk_level', 'low')
+                    email_event_categories[f"{risk_level}_risk"] += 1
+                    
+                    account_impact = event.get('account_impact', 'low')
+                    email_event_categories[f"{account_impact}_impact"] += 1
+                
+                # Generate summary HTML for this email's events with accounts information
+                summary_html = generate_summary_html(
+                    len(email_events), email_event_categories, 0, 
+                    event_categories_to_process, email_events, accounts_str
+                )
+                
+                # Check email verification status before attempting to send
+                ses_client = boto3.client('ses')
+                verification_failed = False
+                verification_error = ""
+                
+                try:
+                    identity_response = ses_client.get_identity_verification_attributes(
+                        Identities=[email]
+                    )
+                    
+                    verification_status = identity_response.get('VerificationAttributes', {}).get(
+                        email, {}
+                    ).get('VerificationStatus', 'NotStarted')
+                    
+                    if verification_status != 'Success':
+                        verification_failed = True
+                        verification_error = f"Recipient email not verified (status: {verification_status})"
+                        print(f"Email verification failed for {email}: {verification_error}")
+                        
+                except Exception as e:
+                    print(f"Warning: Could not verify recipient status for {email}: {e}")
+                    # Continue with sending - this is just a warning
+                
+                # Update event status based on verification check
+                if verification_failed:
+                    # Mark events as failed due to verification
+                    for event in email_events:
+                        event['email_sent_status'] = f'Failed: {verification_error}'
+                    
+                    # Add these events to default email
+                    events_for_default_email.extend(email_events)
+                    
+                    # Track the verification failure
+                    email_sending_results[email] = (False, verification_error)
+                    
+                else:
+                    # Attempt to send email with SES error handling
+                    success, error_message = send_ses_email_with_attachment_to_recipient_with_error_handling(
+                        summary_html, excel_buffer, len(email_events), 
+                        email_event_categories, email_events, 
+                        email, accounts_str
+                    )
+                    
+                    # Track the result
+                    email_sending_results[email] = (success, error_message)
+                    
+                    if success:
+                        print(f"Successfully sent email to {email}")
+                        # Update event status for successful sends
+                        for event in email_events:
+                            event['email_sent_status'] = 'Sent successfully'
+                    else:
+                        print(f"Failed to send email to {email}: {error_message}")
+                        # Add these events to default email and update status
+                        events_for_default_email.extend(email_events)
+                        for event in email_events:
+                            event['email_sent_status'] = f'Failed: {error_message}'
+                
+            except Exception as e:
+                error_msg = str(e)
+                print(f"Unexpected error sending email to {email}: {error_msg}")
+                traceback.print_exc()
+                
+                # Track the failure
+                email_sending_results[email] = (False, error_msg)
+                
+                # Add these events to default email and update status
+                events_for_default_email.extend(email_events)
+                for event in email_events:
+                    event['email_sent_status'] = f'Failed: {error_msg}'
+        
+        # Log summary of what happened
+        total_failed_events = len(events_for_default_email)
+        total_unmapped_events = len(unmapped_events)
+        print(f"Email sending summary: {len(events_for_default_email)} failed events, {len(unmapped_events)} unmapped events")
+        
+        # ALWAYS send master email with all events and tracking columns (this is the ONLY email to default recipients)
+        try:
+            print(f"Sending master email with all {len(events_analysis)} events and tracking information")
+            
+            # Create master Excel report with tracking columns
+            master_excel_buffer = create_excel_report_improved_with_tracking(events_analysis)
+            
+            # Generate master summary HTML
+            master_summary_html = generate_summary_html(
+                items_count, event_categories, filtered_count, 
+                event_categories_to_process, events_analysis
+            )
+            
+            # Send master email to default recipients
+            send_ses_email_with_attachment_master(master_summary_html, master_excel_buffer, items_count, event_categories, events_analysis)
+            
+        except Exception as e:
+            print(f"Error sending master email: {str(e)}")
+            traceback.print_exc()
+            
+    except Exception as e:
+        print(f"Error in send_account_specific_emails: {str(e)}")
+        traceback.print_exc()
+        # Fallback to sending all events to default email
+        try:
+            # Add tracking columns for fallback
+            for event in events_analysis:
+                if 'mapped_email' not in event:
+                    event['mapped_email'] = 'No mapping'
+                if 'email_sent_status' not in event:
+                    event['email_sent_status'] = 'Sent to default (fallback)'
+            
+            excel_buffer = create_excel_report_improved_with_tracking(events_analysis)
+            summary_html = generate_summary_html(
+                items_count, event_categories, filtered_count, 
+                event_categories_to_process, events_analysis
+            )
+            send_ses_email_with_attachment(summary_html, excel_buffer, items_count, event_categories, events_analysis)
+        except Exception as fallback_error:
+            print(f"Error in fallback email sending: {str(fallback_error)}")
+
+
+def send_ses_email_with_attachment_to_recipient_with_error_handling(html_content, excel_buffer, total_events, event_categories, events_analysis, recipient_email, accounts_str):
+    """
+    Send email with Excel attachment to a specific recipient with SES error handling
+    
+    Args:
+        html_content (str): HTML content for email body
+        excel_buffer (BytesIO): Excel file as bytes
+        total_events (int): Total number of events
+        event_categories (dict): Event categories count
+        events_analysis (list): List of analyzed events
+        recipient_email (str): Email address to send to
+        accounts_str (str): Comma-separated string of account IDs for subject line and filename
+        
+    Returns:
+        tuple: (success: bool, error_message: str)
+    """
+    try:
+        # Get email configuration from environment variables
+        sender = os.environ['SENDER_EMAIL']
+        recipients = [recipient_email.strip()]
+        
+        # Create email subject with counts and account IDs
+        critical_count = event_categories.get('critical', 0)
+        high_risk_count = sum(1 for event in events_analysis if event.get('risk_level', '').lower() == 'high')
+        
+        # Create account identifier for subject - use "Accounts" if multiple, "Account" if single
+        account_list = [acc.strip() for acc in accounts_str.split(',')]
+        if len(account_list) > 1:
+            account_identifier = f"Accounts [{accounts_str}]"
+        else:
+            account_identifier = f"Account {accounts_str}"
+        
+        if critical_count > 0:
+            subject = f"{customer_name} [CRITICAL] AWS Health Events Analysis - {account_identifier} - {critical_count} Critical, {high_risk_count} High Risk Events"
+        elif high_risk_count > 0:
+            subject = f"{customer_name} [HIGH RISK] AWS Health Events Analysis - {account_identifier} - {high_risk_count} High Risk Events"
+        else:
+            subject = f"{customer_name} AWS Health Events Analysis - {account_identifier} - {total_events} Events"
+        
+        # Generate Excel filename with account IDs (sanitize for filename)
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        current_time = datetime.now().strftime('%H-%M-%S')
+        # Replace commas and spaces with underscores for filename safety
+        accounts_filename = accounts_str.replace(',', '_').replace(' ', '')
+        excel_filename = f"AWS_Health_Events_Analysis_Accounts_{accounts_filename}_{current_date}_{current_time}.xlsx"
+        
+        # Create SES client
+        ses_client = boto3.client('ses')
+        
+        # Create raw email message with attachment
+        msg_raw = {
+            'Source': sender,
+            'Destinations': recipients,
+            'RawMessage': {
+                'Data': create_raw_email_with_attachment(
+                    sender=sender,
+                    recipients=recipients,
+                    subject=subject,
+                    html_body=html_content,
+                    attachment_data=excel_buffer.getvalue(),
+                    attachment_name=excel_filename
+                )
+            }
+        }
+        
+        # Check if recipient email is verified before sending
+        try:
+            identity_response = ses_client.get_identity_verification_attributes(
+                Identities=[recipient_email]
+            )
+            
+            verification_status = identity_response.get('VerificationAttributes', {}).get(
+                recipient_email, {}
+            ).get('VerificationStatus', 'NotStarted')
+            
+            if verification_status != 'Success':
+                return False, f"Recipient email not verified (status: {verification_status})"
+                
+        except Exception as e:
+            print(f"Warning: Could not verify recipient status for {recipient_email}: {e}")
+            # Continue with sending - this is just a warning, don't fail the send
+        
+        # Send email with SES error handling
+        response = ses_client.send_raw_email(**msg_raw)
+        print(f"Account-specific email sent successfully to {recipient_email}. Message ID: {response['MessageId']}")
+
+        # Upload to S3 if configured
+        try:
+            # Determine which bucket to use - external or internal
+            bucket_name = S3_BUCKET_NAME if S3_BUCKET_NAME else REPORTS_BUCKET
+            
+            if bucket_name:
+                # Create S3 client
+                s3_client = boto3.client('s3')
+                
+                # Generate S3 key with prefix if provided (only for external bucket)
+                if S3_BUCKET_NAME:
+                    s3_key = f"{S3_KEY_PREFIX.rstrip('/')}/{excel_filename}" if S3_KEY_PREFIX else excel_filename
+                else:
+                    s3_key = excel_filename  # No prefix for internal bucket
+                
+                # Reset buffer position to the beginning
+                excel_buffer.seek(0)
+                
+                # Upload buffer to S3 using put_object
+                s3_client.put_object(
+                    Bucket=bucket_name,
+                    Key=s3_key,
+                    Body=excel_buffer.getvalue(),
+                    ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                )
+                
+                # Generate S3 URL for the uploaded file
+                s3_url = f"s3://{bucket_name}/{s3_key}"
+                print(f"Successfully uploaded account-specific file to {s3_url}")
+                     
+        except Exception as e:
+            print(f"Error uploading account-specific file to S3: {str(e)}")
+        
+        return True, "Success"
+        
+    except ClientError as e:
+        # Handle SES-specific errors
+        error_code = e.response['Error']['Code']
+        error_message = e.response['Error']['Message']
+        
+        if error_code == 'MessageRejected':
+            if 'not verified' in error_message.lower() or 'pending approval' in error_message.lower():
+                return False, f"Email not verified: {error_message}"
+            else:
+                return False, f"Message rejected: {error_message}"
+        elif error_code == 'SendingPausedException':
+            return False, f"Sending paused: {error_message}"
+        elif error_code == 'MailFromDomainNotVerifiedException':
+            return False, f"Domain not verified: {error_message}"
+        else:
+            return False, f"SES error ({error_code}): {error_message}"
+            
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
+def send_ses_email_with_attachment_master(html_content, excel_buffer, total_events, event_categories, events_analysis):
+    """
+    Send master email with Excel attachment containing all events and tracking columns
+    
+    Args:
+        html_content (str): HTML content for email body
+        excel_buffer (BytesIO): Excel file as bytes
+        total_events (int): Total number of events
+        event_categories (dict): Event categories count
+        events_analysis (list): List of analyzed events
+        
+    Returns:
+        None
+    """
+    try:
+        # Get email configuration from environment variables
+        sender = os.environ['SENDER_EMAIL']
+        recipients_str = os.environ['RECIPIENT_EMAILS']
+        recipients = [email.strip() for email in recipients_str.split(',')]
+        
+        # Create email subject with counts
+        critical_count = event_categories.get('critical', 0)
+        high_risk_count = sum(1 for event in events_analysis if event.get('risk_level', '').lower() == 'high')
+        
+        if critical_count > 0:
+            subject = f"{customer_name} [MASTER] [CRITICAL] AWS Health Events Analysis - {critical_count} Critical, {high_risk_count} High Risk Events"
+        elif high_risk_count > 0:
+            subject = f"{customer_name} [MASTER] [HIGH RISK] AWS Health Events Analysis - {high_risk_count} High Risk Events"
+        else:
+            subject = f"{customer_name} [MASTER] AWS Health Events Analysis - {total_events} Events"
+        
+        # Generate Excel filename
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        current_time = datetime.now().strftime('%H-%M-%S')
+        excel_filename = f"AWS_Health_Events_Analysis_MASTER_{current_date}_{current_time}.xlsx"
+        
+        # Create SES client
+        ses_client = boto3.client('ses')
+        
+        # Create raw email message with attachment
+        msg_raw = {
+            'Source': sender,
+            'Destinations': recipients,
+            'RawMessage': {
+                'Data': create_raw_email_with_attachment(
+                    sender=sender,
+                    recipients=recipients,
+                    subject=subject,
+                    html_body=html_content,
+                    attachment_data=excel_buffer.getvalue(),
+                    attachment_name=excel_filename
+                )
+            }
+        }
+        
+        # Check if recipient emails are verified before sending
+        unverified_recipients = []
+        for recipient in recipients:
+            try:
+                identity_response = ses_client.get_identity_verification_attributes(
+                    Identities=[recipient]
+                )
+                
+                verification_status = identity_response.get('VerificationAttributes', {}).get(
+                    recipient, {}
+                ).get('VerificationStatus', 'NotStarted')
+                
+                if verification_status != 'Success':
+                    unverified_recipients.append(f"{recipient} (status: {verification_status})")
+                    
+            except Exception as e:
+                print(f"Warning: Could not verify recipient status for {recipient}: {e}")
+                # Continue with sending - this is just a warning
+        
+        if unverified_recipients:
+            print(f"Warning: Some master email recipients are not verified: {', '.join(unverified_recipients)}")
+        
+        # Send email
+        response = ses_client.send_raw_email(**msg_raw)
+        print(f"Master email sent successfully. Message ID: {response['MessageId']}")
+
+        # Upload to S3 if configured
+        try:
+            # Determine which bucket to use - external or internal
+            bucket_name = S3_BUCKET_NAME if S3_BUCKET_NAME else REPORTS_BUCKET
+            
+            if bucket_name:
+                # Create S3 client
+                s3_client = boto3.client('s3')
+                
+                # Generate S3 key with prefix if provided (only for external bucket)
+                if S3_BUCKET_NAME:
+                    s3_key = f"{S3_KEY_PREFIX.rstrip('/')}/{excel_filename}" if S3_KEY_PREFIX else excel_filename
+                else:
+                    s3_key = excel_filename  # No prefix for internal bucket
+                
+                # Reset buffer position to the beginning
+                excel_buffer.seek(0)
+                
+                # Upload buffer to S3 using put_object
+                s3_client.put_object(
+                    Bucket=bucket_name,
+                    Key=s3_key,
+                    Body=excel_buffer.getvalue(),
+                    ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                )
+                
+                # Generate S3 URL for the uploaded file
+                s3_url = f"s3://{bucket_name}/{s3_key}"
+                print(f"Successfully uploaded master file to {s3_url}")
+                     
+        except Exception as e:
+            print(f"Error uploading master file to S3: {str(e)}")
+        
+    except Exception as e:
+        print(f"Error sending master email: {str(e)}")
+        traceback.print_exc()
+
+
+def create_excel_report_improved_with_tracking(events_analysis):
+    """
+    Create an improved Excel report with detailed event analysis and tracking columns
+    
+    Args:
+        events_analysis (list): List of analyzed events data
+        
+    Returns:
+        BytesIO: Excel file as bytes
+    """
+    # Create workbook and sheets
+    wb = Workbook()
+    summary_sheet = wb.active
+    summary_sheet.title = "Summary"
+    events_sheet = wb.create_sheet(title="All Events")
+    
+    # Add summary data
+    summary_sheet['A1'] = "AWS Health Events Analysis Summary"
+    summary_sheet['A1'].font = Font(size=16, bold=True)
+    summary_sheet.merge_cells('A1:C1')
+    
+    # Add event counts by category
+    event_categories = defaultdict(int)
+    for event in events_analysis:
+        event_categories[event.get('event_type_category', 'unknown')] += 1
+        if event.get('critical', False):
+            event_categories['critical'] += 1
+        
+        risk_level = event.get('risk_level', 'low').lower()
+        if risk_level == 'high':
+            event_categories['high_risk'] += 1
+        elif risk_level == 'medium':
+            event_categories['medium_risk'] += 1
+        elif risk_level == 'low':
+            event_categories['low_risk'] += 1
+            
+        impact = event.get('account_impact', 'low').lower()
+        if impact == 'high':
+            event_categories['high_impact'] += 1
+        elif impact == 'medium':
+            event_categories['medium_impact'] += 1
+        elif impact == 'low':
+            event_categories['low_impact'] += 1
+    
+    # Add summary counts
+    summary_sheet['A3'] = "Event Categories"
+    summary_sheet['A3'].font = Font(bold=True)
+    
+    row = 4
+    for category, count in event_categories.items():
+        summary_sheet[f'A{row}'] = category.replace('_', ' ').title()
+        summary_sheet[f'B{row}'] = count
+        row += 1
+    
+    # Add headers to events sheet with tracking columns
+    headers = [
+        "Event ARN",
+        "Event Type", 
+        "Region", 
+        "Start Time", 
+        "Last Update", 
+        "Category",
+        "Description",
+        "Critical", 
+        "Risk Level", 
+        "Account ID", 
+        "Key Date",
+        "Time Sensitivity", 
+        "Risk Category", 
+        "Required Actions", 
+        "Impact Analysis", 
+        "Consequences If Ignored", 
+        "Affected Resources",
+        "Mapped Email",  # New tracking column
+        "Email Status"   # New tracking column
+    ]
+    
+    for col_num, header in enumerate(headers, 1):
+        cell = events_sheet.cell(row=1, column=col_num)
+        cell.value = header
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+    
+    # Add event data with tracking columns
+    for row_num, event in enumerate(events_analysis, 2):
+        event_arn = event.get('eventArn', event.get('arn', 'N/A'))
+        events_sheet.cell(row=row_num, column=1).value = event_arn
+        events_sheet.cell(row=row_num, column=2).value = event.get('event_type', 'N/A')
+        events_sheet.cell(row=row_num, column=3).value = event.get('region', 'N/A')
+        events_sheet.cell(row=row_num, column=4).value = event.get('start_time', 'N/A')
+        events_sheet.cell(row=row_num, column=5).value = event.get('last_update_time', 'N/A')
+        events_sheet.cell(row=row_num, column=6).value = event.get('event_type_category', 'N/A')
+        
+        # Add description with text wrapping
+        description_cell = events_sheet.cell(row=row_num, column=7)
+        description_cell.value = event.get('description', 'N/A')
+        description_cell.alignment = Alignment(wrap_text=True, vertical='top')
+        
+        events_sheet.cell(row=row_num, column=8).value = "Yes" if event.get('critical', False) else "No"
+        events_sheet.cell(row=row_num, column=9).value = event.get('risk_level', 'low').upper()
+        events_sheet.cell(row=row_num, column=10).value = event.get('accountId', 'N/A')
+        events_sheet.cell(row=row_num, column=11).value = event.get('key_date', 'N/A')
+        events_sheet.cell(row=row_num, column=12).value = event.get('time_sensitivity', 'Routine')
+        events_sheet.cell(row=row_num, column=13).value = event.get('risk_category', 'Unknown')
+        events_sheet.cell(row=row_num, column=14).value = event.get('required_actions', '')
+        events_sheet.cell(row=row_num, column=15).value = event.get('impact_analysis', '')
+        events_sheet.cell(row=row_num, column=16).value = event.get('consequences_if_ignored', '')
+        events_sheet.cell(row=row_num, column=17).value = event.get('affected_resources', 'None')
+        
+        # Add tracking columns
+        events_sheet.cell(row=row_num, column=18).value = event.get('mapped_email', 'No mapping')
+        events_sheet.cell(row=row_num, column=19).value = event.get('email_sent_status', 'Unknown')
+        
+        # Color coding based on risk level
+        risk_level = event.get('risk_level', 'low').lower()
+        is_critical = event.get('critical', False)
+        
+        if is_critical:
+            for col_num in range(1, 20):
+                events_sheet.cell(row=row_num, column=col_num).fill = PatternFill(
+                    start_color="FFCCCC", end_color="FFCCCC", fill_type="solid"
+                )
+        elif risk_level == 'high':
+            for col_num in range(1, 20):
+                events_sheet.cell(row=row_num, column=col_num).fill = PatternFill(
+                    start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"
+                )
+        elif risk_level == 'medium':
+            for col_num in range(1, 20):
+                events_sheet.cell(row=row_num, column=col_num).fill = PatternFill(
+                    start_color="E6F2FF", end_color="E6F2FF", fill_type="solid"
+                )
+    
+    # Auto-adjust column widths
+    for col in events_sheet.columns:
+        max_length = 0
+        column = col[0].column_letter
+        for cell in col:
+            if cell.value:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = min(len(str(cell.value)), 50)  # Cap at 50 characters
+                except:
+                    pass
+        adjusted_width = max_length + 2
+        events_sheet.column_dimensions[column].width = adjusted_width
+    
+    # Set specific widths for key columns
+    events_sheet.column_dimensions['G'].width = 60  # Description column
+    events_sheet.column_dimensions['R'].width = 30  # Mapped Email column
+    events_sheet.column_dimensions['S'].width = 40  # Email Status column
+    
+    # Create critical events sheet with tracking columns
+    critical_sheet = wb.create_sheet(title="Critical Events")
+    
+    # Add headers (same as events sheet)
+    for col_num, header in enumerate(headers, 1):
+        cell = critical_sheet.cell(row=1, column=col_num)
+        cell.value = header
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+    
+    # Add critical event data
+    critical_events = [event for event in events_analysis if event.get('critical', False)]
+    if not critical_events:
+        critical_sheet.cell(row=2, column=1).value = "No critical events found"
+        critical_sheet.merge_cells('A2:S2')  # Updated to include new columns
+        critical_sheet.cell(row=2, column=1).alignment = Alignment(horizontal='center')
+    else:
+        for row_num, event in enumerate(critical_events, 2):
+            event_arn = event.get('eventArn', event.get('arn', 'N/A'))
+            critical_sheet.cell(row=row_num, column=1).value = event_arn
+            critical_sheet.cell(row=row_num, column=2).value = event.get('event_type', 'N/A')
+            critical_sheet.cell(row=row_num, column=3).value = event.get('region', 'N/A')
+            critical_sheet.cell(row=row_num, column=4).value = event.get('start_time', 'N/A')
+            critical_sheet.cell(row=row_num, column=5).value = event.get('last_update_time', 'N/A')
+            critical_sheet.cell(row=row_num, column=6).value = event.get('event_type_category', 'N/A')
+            
+            # Add description with text wrapping
+            description_cell = critical_sheet.cell(row=row_num, column=7)
+            description_cell.value = event.get('description', 'N/A')
+            description_cell.alignment = Alignment(wrap_text=True, vertical='top')
+            
+            critical_sheet.cell(row=row_num, column=8).value = "Yes"
+            critical_sheet.cell(row=row_num, column=9).value = event.get('risk_level', 'low').upper()
+            critical_sheet.cell(row=row_num, column=10).value = event.get('accountId', 'N/A')
+            critical_sheet.cell(row=row_num, column=11).value = event.get('key_date', 'N/A')
+            critical_sheet.cell(row=row_num, column=12).value = event.get('time_sensitivity', 'Routine')
+            critical_sheet.cell(row=row_num, column=13).value = event.get('risk_category', 'Unknown')
+            critical_sheet.cell(row=row_num, column=14).value = event.get('required_actions', '')
+            critical_sheet.cell(row=row_num, column=15).value = event.get('impact_analysis', '')
+            critical_sheet.cell(row=row_num, column=16).value = event.get('consequences_if_ignored', '')
+            critical_sheet.cell(row=row_num, column=17).value = event.get('affected_resources', 'None')
+            
+            # Add tracking columns
+            critical_sheet.cell(row=row_num, column=18).value = event.get('mapped_email', 'No mapping')
+            critical_sheet.cell(row=row_num, column=19).value = event.get('email_sent_status', 'Unknown')
+            
+            # Apply critical highlighting
+            for col_num in range(1, 20):
+                critical_sheet.cell(row=row_num, column=col_num).fill = PatternFill(
+                    start_color="FFCCCC", end_color="FFCCCC", fill_type="solid"
+                )
+    
+    # Auto-adjust column widths for critical sheet
+    for col in critical_sheet.columns:
+        max_length = 0
+        column = col[0].column_letter
+        for cell in col:
+            if cell.value:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = min(len(str(cell.value)), 50)  # Cap at 50 characters
+                except:
+                    pass
+        adjusted_width = max_length + 2
+        critical_sheet.column_dimensions[column].width = adjusted_width
+    
+    # Set specific widths for key columns in critical sheet
+    critical_sheet.column_dimensions['G'].width = 60  # Description column
+    critical_sheet.column_dimensions['R'].width = 30  # Mapped Email column
+    critical_sheet.column_dimensions['S'].width = 40  # Email Status column
+    
+    # Create risk analysis sheet with full Bedrock analysis
+    analysis_sheet = wb.create_sheet(title="Risk Analysis")
+    
+    # Add headers
+    analysis_headers = ["Event Type", "Region", "Risk Level", "Full Analysis"]
+    
+    for col_num, header in enumerate(analysis_headers, 1):
+        cell = analysis_sheet.cell(row=1, column=col_num)
+        cell.value = header
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+    
+    # Add analysis data
+    for row_num, event in enumerate(events_analysis, 2):
+        # Get event type from either format
+        event_type = event.get('eventTypeCode', event.get('event_type', 'N/A'))
+        analysis_sheet.cell(row=row_num, column=1).value = event_type
+        
+        # Get region
+        analysis_sheet.cell(row=row_num, column=2).value = event.get('region', 'N/A')
+        
+        # Get risk level
+        analysis_sheet.cell(row=row_num, column=3).value = event.get('risk_level', 'low').upper()
+        
+        # Fix: Ensure analysis_text is a string
+        analysis_text = event.get('analysis_text', '')
+        
+        # Handle different data types
+        if isinstance(analysis_text, dict):
+            # Custom JSON encoder to handle datetime objects
+            def datetime_handler(obj):
+                if isinstance(obj, (datetime, date)):
+                    return obj.isoformat()
+                return str(obj)
+            
+            try:
+                analysis_text = json.dumps(analysis_text, indent=2, default=datetime_handler)
+            except Exception as e:
+                analysis_text = f"Error serializing analysis: {str(e)}"
+        elif not isinstance(analysis_text, str):
+            # Convert non-string values to string
+            try:
+                analysis_text = str(analysis_text)
+            except Exception as e:
+                analysis_text = f"Error converting to string: {str(e)}"
+        
+        # Set the cell value
+        analysis_sheet.cell(row=row_num, column=4).value = analysis_text
+        
+        # Color coding based on risk level
+        risk_level = event.get('risk_level', 'low').lower()
+        is_critical = event.get('critical', False)
+        
+        if is_critical:
+            for col_num in range(1, 5):
+                analysis_sheet.cell(row=row_num, column=col_num).fill = PatternFill(
+                    start_color="FFCCCC", end_color="FFCCCC", fill_type="solid"
+                )
+        elif risk_level == 'high':
+            for col_num in range(1, 5):
+                analysis_sheet.cell(row=row_num, column=col_num).fill = PatternFill(
+                    start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"
+                )
+        elif risk_level == 'medium':
+            for col_num in range(1, 5):
+                analysis_sheet.cell(row=row_num, column=col_num).fill = PatternFill(
+                    start_color="E6F2FF", end_color="E6F2FF", fill_type="solid"
+                )
+    
+    # Set column widths for analysis sheet
+    analysis_sheet.column_dimensions['A'].width = 30
+    analysis_sheet.column_dimensions['B'].width = 15
+    analysis_sheet.column_dimensions['C'].width = 15
+    analysis_sheet.column_dimensions['D'].width = 100
+    
+    # Save to BytesIO
+    excel_buffer = BytesIO()
+    wb.save(excel_buffer)
+    excel_buffer.seek(0)
+    
+    return excel_buffer
+
+
+def send_ses_email_with_attachment_to_recipient(html_content, excel_buffer, total_events, event_categories, events_analysis, recipient_email, accounts_str):
+    """
+    Send email with Excel attachment to a specific recipient
+    
+    Args:
+        html_content (str): HTML content for email body
+        excel_buffer (BytesIO): Excel file as bytes
+        total_events (int): Total number of events
+        event_categories (dict): Event categories count
+        events_analysis (list): List of analyzed events
+        recipient_email (str): Email address to send to
+        accounts_str (str): Comma-separated string of account IDs for subject line and filename
+        
+    Returns:
+        None
+    """
+    try:
+        # Get email configuration from environment variables
+        sender = os.environ['SENDER_EMAIL']
+        recipients = [recipient_email.strip()]
+        
+        # Create email subject with counts and account IDs
+        critical_count = event_categories.get('critical', 0)
+        high_risk_count = sum(1 for event in events_analysis if event.get('risk_level', '').lower() == 'high')
+        
+        if critical_count > 0:
+            subject = f"{customer_name} [CRITICAL] AWS Health Events Analysis - {critical_count} Critical, {high_risk_count} High Risk Events"
+        elif high_risk_count > 0:
+            subject = f"{customer_name} [HIGH RISK] AWS Health Events Analysis - {high_risk_count} High Risk Events"
+        else:
+            subject = f"{customer_name} AWS Health Events Analysis - {total_events} Events"
+        
+        # Generate Excel filename with account IDs (sanitize for filename)
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        current_time = datetime.now().strftime('%H-%M-%S')
+        # Replace commas and spaces with underscores for filename safety
+        accounts_filename = accounts_str.replace(',', '_').replace(' ', '')
+        excel_filename = f"AWS_Health_Events_Analysis_Accounts_{accounts_filename}_{current_date}_{current_time}.xlsx"
+        
+        # Create SES client
+        ses_client = boto3.client('ses')
+        
+        # Create raw email message with attachment
+        msg_raw = {
+            'Source': sender,
+            'Destinations': recipients,
+            'RawMessage': {
+                'Data': create_raw_email_with_attachment(
+                    sender=sender,
+                    recipients=recipients,
+                    subject=subject,
+                    html_body=html_content,
+                    attachment_data=excel_buffer.getvalue(),
+                    attachment_name=excel_filename
+                )
+            }
+        }
+        
+        # Send email
+        response = ses_client.send_raw_email(**msg_raw)
+        print(f"Account-specific email sent successfully to {recipient_email}. Message ID: {response['MessageId']}")
+
+        # Upload to S3 if configured
+        try:
+            # Determine which bucket to use - external or internal
+            bucket_name = S3_BUCKET_NAME if S3_BUCKET_NAME else REPORTS_BUCKET
+            
+            if bucket_name:
+                # Create S3 client
+                s3_client = boto3.client('s3')
+                
+                # Generate S3 key with prefix if provided (only for external bucket)
+                if S3_BUCKET_NAME:
+                    s3_key = f"{S3_KEY_PREFIX.rstrip('/')}/{excel_filename}" if S3_KEY_PREFIX else excel_filename
+                else:
+                    s3_key = excel_filename  # No prefix for internal bucket
+                
+                # Reset buffer position to the beginning
+                excel_buffer.seek(0)
+                
+                # Upload buffer to S3 using put_object
+                s3_client.put_object(
+                    Bucket=bucket_name,
+                    Key=s3_key,
+                    Body=excel_buffer.getvalue(),
+                    ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                )
+                
+                # Generate S3 URL for the uploaded file
+                s3_url = f"s3://{bucket_name}/{s3_key}"
+                print(f"Successfully uploaded account-specific file to {s3_url}")
+                     
+        except Exception as e:
+            print(f"Error uploading account-specific file to S3: {str(e)}")
+        
+    except Exception as e:
+        print(f"Error sending account-specific email: {str(e)}")
+        traceback.print_exc()
 
 
 def send_ses_email_with_attachment(html_content, excel_buffer, total_events, event_categories,events_analysis):
