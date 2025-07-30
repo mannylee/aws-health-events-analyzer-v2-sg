@@ -6,6 +6,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# SAM build deploy
+sam-build-deploy.sh
+testing/
+
 # Distribution / packaging
 .Python
 build/
