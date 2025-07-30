@@ -9,6 +9,9 @@ A serverless solution that analyzes AWS Health events using Amazon Bedrock, cate
 - Categorizes events by risk level and impact
 - Generates detailed Excel reports with event analysis
 - Sends email notifications with reports attached
+- **Account-specific email routing** - Route events to different teams based on AWS account
+- **S3 health events override** - Process pre-exported health events from S3 for testing/compliance
+- **Email verification checks** - Ensures emails are only sent to verified SES recipients
 - Runs automatically on a weekly schedule (every Tuesday at 5 PM UTC)
 - Stores reports in a secure S3 bucket with lifecycle management
 - Optional external S3 bucket integration for report storage
@@ -98,6 +101,99 @@ sam deploy --guided
 # When prompted for S3KeyPrefix, enter your desired prefix (e.g., health-events)
 ```
 
+## Advanced Features
+
+### Account-Specific Email Routing
+
+The solution supports routing health events to different email addresses based on the AWS account where the events occurred. This is particularly useful for organizations managing multiple AWS accounts where different teams should receive notifications for their respective accounts.
+
+#### Configuration
+
+Set the `AccountEmailMapping` parameter with account-to-email mappings in the format:
+```
+account1:email1@example.com,account2:email2@example.com,account3:email3@example.com
+```
+
+#### How It Works
+
+1. **Individual Account Emails**: Events are grouped by account and sent to the specified email addresses
+2. **Master Email**: A comprehensive report with all events is still sent to the default recipients specified in `RecipientEmails`
+3. **Email Verification**: The solution verifies that recipient emails are verified in SES before sending
+4. **Fallback Handling**: If an account-specific email fails to send, those events are included in the master email
+
+#### Example Configuration
+
+```bash
+sam deploy --parameter-overrides \
+  SenderEmail=notifications@company.com \
+  RecipientEmails=admin@company.com,security@company.com \
+  AccountEmailMapping="123456789012:team-a@company.com,987654321098:team-b@company.com"
+```
+
+#### Benefits
+
+- **Targeted Notifications**: Teams only receive events relevant to their accounts
+- **Reduced Noise**: Account-specific teams don't get overwhelmed with events from other accounts
+- **Audit Trail**: Master email provides complete visibility for administrators
+- **Flexible Routing**: Easy to add or modify account-to-email mappings
+
+### S3 Health Events Override
+
+For testing, compliance, or offline analysis scenarios, the solution can process health events from a pre-exported S3 file instead of calling the AWS Health API directly.
+
+#### Configuration
+
+Set the `OverrideS3HealthEventsArn` parameter with the full S3 object ARN:
+```
+arn:aws:s3:::your-bucket/path/to/health-events.json
+```
+
+#### Use Cases
+
+1. **Testing**: Use sample health events data for testing without triggering real API calls
+2. **Compliance**: Process historical health events data that was previously exported
+3. **Offline Analysis**: Analyze health events in environments without direct Health API access
+4. **Cost Optimization**: Reduce Health API calls by processing pre-exported data
+
+#### Data Format
+
+The S3 file should contain health events in the same JSON format returned by the AWS Health API:
+
+```json
+{
+  "events": [
+    {
+      "arn": "arn:aws:health:us-east-1::event/...",
+      "service": "EC2",
+      "eventTypeCode": "AWS_EC2_INSTANCE_REBOOT_MAINTENANCE_SCHEDULED",
+      "eventTypeCategory": "scheduledChange",
+      "region": "us-east-1",
+      "startTime": "2024-01-15T10:00:00Z",
+      "endTime": "2024-01-15T12:00:00Z",
+      "lastUpdatedTime": "2024-01-15T09:00:00Z",
+      "statusCode": "open",
+      "eventScopeCode": "ACCOUNT_SPECIFIC"
+    }
+  ]
+}
+```
+
+#### Example Configuration
+
+```bash
+sam deploy --parameter-overrides \
+  SenderEmail=notifications@company.com \
+  RecipientEmails=admin@company.com \
+  OverrideS3HealthEventsArn="arn:aws:s3:::my-health-data/exports/health-events-2024-01.json"
+```
+
+#### Important Notes
+
+- When using S3 override, the solution will NOT call the AWS Health API
+- The Lambda function needs read permissions to the specified S3 object
+- The S3 object should be in the same region as the Lambda function for optimal performance
+- This feature is primarily intended for testing and special use cases
+
 ## Multiple Installations
 
 If you need to deploy multiple instances of this solution (e.g., for different environments or customers), you should modify your `samconfig.toml` file for each installation:
@@ -156,6 +252,8 @@ parameter_overrides = "SenderEmail=\"customer2@example.com\" RecipientEmails=\"r
 | BedrockTopP | Top-p parameter for Bedrock model (0.0-1.0) | 0.9 |
 | S3BucketName | Name of external S3 bucket for report storage (optional) | '' |
 | S3KeyPrefix | Prefix for objects in the external S3 bucket (optional) | '' |
+| AccountEmailMapping | Account-specific email routing configuration (optional) | '' |
+| OverrideS3HealthEventsArn | S3 object ARN for using pre-exported health events instead of API (optional) | '' |
 
 ## Bedrock Configuration
 
@@ -241,6 +339,16 @@ The solution publishes the following CloudWatch metrics:
   - Check CloudWatch Logs for specific error messages
   - For cross-account buckets, verify bucket policies allow access
   - **Tip**: Leave S3BucketName empty to use the internal bucket with automatic permissions
+- **Account-specific email issues**:
+  - Verify that all email addresses in AccountEmailMapping are verified in SES
+  - Check CloudWatch Logs for "Recipient email not verified" messages
+  - Ensure the mapping format is correct: `account1:email1@example.com,account2:email2@example.com`
+  - Failed account-specific emails will fall back to the master email recipients
+- **S3 Health Events Override issues**:
+  - Verify the S3 object ARN is correct and the object exists
+  - Ensure the Lambda function has read permissions to the S3 object
+  - Check that the JSON format matches the expected AWS Health API response format
+  - Verify the S3 object is in the same region as the Lambda function
 
 ## S3 Access Troubleshooting
 
