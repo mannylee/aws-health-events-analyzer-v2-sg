@@ -120,6 +120,7 @@ account1:email1@example.com,account2:email2@example.com,account3:email3@example.
 2. **Master Email**: A comprehensive report with all events is still sent to the default recipients specified in `RecipientEmails`
 3. **Email Verification**: The solution verifies that recipient emails are verified in SES before sending
 4. **Fallback Handling**: If an account-specific email fails to send, those events are included in the master email
+5. **Email Status Tracking**: The master spreadsheet includes tracking columns ("Mapped Email" and "Email Status") that show which email address each event was mapped to and whether the email was sent successfully, failed due to SES verification issues, or sent to the default recipients
 
 #### Example Configuration
 
@@ -134,7 +135,8 @@ sam deploy --parameter-overrides \
 
 - **Targeted Notifications**: Teams only receive events relevant to their accounts
 - **Reduced Noise**: Account-specific teams don't get overwhelmed with events from other accounts
-- **Audit Trail**: Master email provides complete visibility for administrators
+- **Audit Trail**: Master email provides complete visibility for administrators with detailed tracking of email delivery status
+- **Email Status Visibility**: The master spreadsheet shows exactly which emails were sent successfully, which failed due to SES verification, and which events were routed to default recipients
 - **Flexible Routing**: Easy to add or modify account-to-email mappings
 
 ### S3 Health Events Override
