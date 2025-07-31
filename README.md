@@ -5,6 +5,7 @@ A serverless solution that analyzes AWS Health events using Amazon Bedrock, cate
 ## Features
 
 - Retrieves AWS Health events directly from the AWS Health API
+- **Focuses on actionable events** - Only processes open and upcoming events (excludes closed/resolved events)
 - Analyzes events using Amazon Bedrock's Claude 3 Sonnet model
 - Categorizes events by risk level and impact
 - Generates detailed Excel reports with event analysis
@@ -107,12 +108,15 @@ sam deploy --guided
 
 The solution supports routing health events to different email addresses based on the AWS account where the events occurred. This is particularly useful for organizations managing multiple AWS accounts where different teams should receive notifications for their respective accounts.
 
+#### Prerequisites
+
+- AWS Organizations must be enabled
+- The Lambda execution role must have `organizations:ListAccounts` and `organizations:DescribeAccount` permissions (already included in the template)
+- Account email addresses in AWS Organizations should be verified in SES if running in sandbox mode
+
 #### Configuration
 
-Set the `AccountEmailMapping` parameter with account-to-email mappings in the format:
-```
-account1:email1@example.com,account2:email2@example.com,account3:email3@example.com
-```
+Enable account-specific email routing by setting the `UseOrganizationAccountEmailMapping` parameter to `true`. The solution will automatically fetch account email addresses from AWS Organizations.
 
 #### How It Works
 
@@ -128,7 +132,7 @@ account1:email1@example.com,account2:email2@example.com,account3:email3@example.
 sam deploy --parameter-overrides \
   SenderEmail=notifications@company.com \
   RecipientEmails=admin@company.com,security@company.com \
-  AccountEmailMapping="123456789012:team-a@company.com,987654321098:team-b@company.com"
+  UseOrganizationAccountEmailMapping=true
 ```
 
 #### Benefits
@@ -137,7 +141,7 @@ sam deploy --parameter-overrides \
 - **Reduced Noise**: Account-specific teams don't get overwhelmed with events from other accounts
 - **Audit Trail**: Master email provides complete visibility for administrators with detailed tracking of email delivery status
 - **Email Status Visibility**: The master spreadsheet shows exactly which emails were sent successfully, which failed due to SES verification, and which events were routed to default recipients
-- **Flexible Routing**: Easy to add or modify account-to-email mappings
+- **Automatic Discovery**: Account email addresses are automatically retrieved from AWS Organizations
 
 ### S3 Health Events Override
 
@@ -254,7 +258,7 @@ parameter_overrides = "SenderEmail=\"customer2@example.com\" RecipientEmails=\"r
 | BedrockTopP | Top-p parameter for Bedrock model (0.0-1.0) | 0.9 |
 | S3BucketName | Name of external S3 bucket for report storage (optional) | '' |
 | S3KeyPrefix | Prefix for objects in the external S3 bucket (optional) | '' |
-| AccountEmailMapping | Account-specific email routing configuration (optional) | '' |
+| UseOrganizationAccountEmailMapping | Enable account-specific email routing using AWS Organizations (true/false) | 'false' |
 | OverrideS3HealthEventsArn | S3 object ARN for using pre-exported health events instead of API (optional) | '' |
 
 ## Bedrock Configuration
@@ -333,6 +337,7 @@ The solution publishes the following CloudWatch metrics:
   - Verify your AWS Health API access and check the EventCategories filter
   - **Important**: AWS Health API requires Business or Enterprise Support plan
   - Basic and Developer support plans do not have access to AWS Health API
+  - **Note**: The solution only processes open and upcoming events (closed/resolved events are excluded for better focus on actionable items)
 - **No organization events**: Ensure AWS Health organizational view is enabled in your AWS Organizations management account
 - **S3 upload failures**: 
   - If using external S3 bucket: Check if the S3BucketName parameter is correctly specified and the bucket exists
@@ -342,9 +347,9 @@ The solution publishes the following CloudWatch metrics:
   - For cross-account buckets, verify bucket policies allow access
   - **Tip**: Leave S3BucketName empty to use the internal bucket with automatic permissions
 - **Account-specific email issues**:
-  - Verify that all email addresses in AccountEmailMapping are verified in SES
-  - Check CloudWatch Logs for "Recipient email not verified" messages
-  - Ensure the mapping format is correct: `account1:email1@example.com,account2:email2@example.com`
+  - Ensure AWS Organizations is enabled and the Lambda has organizations:ListAccounts permissions
+  - Verify that account email addresses in AWS Organizations are verified in SES (if in sandbox mode)
+  - Check CloudWatch Logs for "Access denied when trying to access AWS Organizations" messages
   - Failed account-specific emails will fall back to the master email recipients
 - **S3 Health Events Override issues**:
   - Verify the S3 object ARN is correct and the object exists
