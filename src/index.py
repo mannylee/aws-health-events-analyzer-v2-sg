@@ -26,16 +26,54 @@ excluded_services_str = os.environ.get('EXCLUDED_SERVICES', '')
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME', '')
 S3_KEY_PREFIX = os.environ.get('S3_KEY_PREFIX', '')
 REPORTS_BUCKET = os.environ.get('REPORTS_BUCKET', '')
-ACCOUNT_EMAIL_MAPPING = os.environ.get('ACCOUNT_EMAIL_MAPPING', '')
+USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING = os.environ.get('USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING', 'false').lower() == 'true'
 OVERRIDE_S3_HEALTH_EVENTS_ARN = os.environ.get('OVERRIDE_S3_HEALTH_EVENTS_ARN', '')
 
 excluded_services = [s.strip() for s in excluded_services_str.split(',') if s.strip()]
 
 
-def parse_account_email_mapping():
+def is_ses_in_sandbox_mode():
     """
-    Parse the ACCOUNT_EMAIL_MAPPING environment variable into two dictionaries.
-    Expected format: "account1:email1@example.com,account2:email2@example.com"
+    Check if SES is running in sandbox mode by examining sending quota.
+    
+    Returns:
+        bool: True if SES is in sandbox mode, False if in production mode
+    """
+    try:
+        ses_client = boto3.client('ses')
+        quota = ses_client.get_send_quota()
+        
+        # Sandbox mode indicators:
+        # - Max24HourSend: 200 emails per 24 hours
+        # - MaxSendRate: 1 email per second
+        max_24_hour_send = quota.get('Max24HourSend', 0)
+        max_send_rate = quota.get('MaxSendRate', 0)
+        
+        is_sandbox = (max_24_hour_send <= 200 and max_send_rate <= 1)
+        
+        # print(f"SES Status - Max24HourSend: {max_24_hour_send}, MaxSendRate: {max_send_rate}")
+        print(f"SES is in {'SANDBOX' if is_sandbox else 'PRODUCTION'} mode")
+        
+        return is_sandbox
+        
+    except Exception as e:
+        print(f"Warning: Could not determine SES mode, assuming sandbox: {e}")
+        return True  # Default to sandbox mode for safety
+
+
+def should_verify_recipient_email():
+    """
+    Determine if recipient email verification is required based on SES mode.
+    
+    Returns:
+        bool: True if verification is required (sandbox mode), False otherwise
+    """
+    return is_ses_in_sandbox_mode()
+
+
+def get_organization_account_email_mapping():
+    """
+    Get account-to-email mapping from AWS Organizations by looking up account contact information.
     
     Returns:
         tuple: (account_to_email_mapping, email_to_accounts_mapping)
@@ -45,25 +83,57 @@ def parse_account_email_mapping():
     account_to_email = {}
     email_to_accounts = defaultdict(list)
     
-    if ACCOUNT_EMAIL_MAPPING:
-        try:
-            pairs = [pair.strip() for pair in ACCOUNT_EMAIL_MAPPING.split(',') if pair.strip()]
-            for pair in pairs:
-                if ':' in pair:
-                    account_id, email = pair.split(':', 1)
-                    account_id = account_id.strip()
-                    email = email.strip()
-                    
-                    account_to_email[account_id] = email
-                    email_to_accounts[email].append(account_id)
-                    print(f"Account mapping: {account_id} -> {email}")
-        except Exception as e:
-            print(f"Error parsing ACCOUNT_EMAIL_MAPPING: {str(e)}")
+    if not USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING:
+        print("Organization account email mapping is disabled")
+        return account_to_email, dict(email_to_accounts)
     
-    print(f"Parsed {len(account_to_email)} account email mappings")
-    print(f"Found {len(email_to_accounts)} unique email addresses")
-    for email, accounts in email_to_accounts.items():
-        print(f"Email {email} will receive events for accounts: {', '.join(accounts)}")
+    try:
+        print("Fetching account email mappings from AWS Organizations...")
+        
+        # Create Organizations client
+        org_client = boto3.client('organizations')
+        
+        # List all accounts in the organization
+        paginator = org_client.get_paginator('list_accounts')
+        
+        for page in paginator.paginate():
+            for account in page['Accounts']:
+                account_id = account['Id']
+                account_name = account.get('Name', 'Unknown')
+                account_email = account.get('Email')
+                
+                if account_email:
+                    account_to_email[account_id] = account_email
+                    email_to_accounts[account_email].append(account_id)
+                    print(f"Account mapping: {account_id} ({account_name}) -> {account_email}")
+                else:
+                    print(f"Warning: No email found for account {account_id} ({account_name})")
+        
+        print(f"Retrieved {len(account_to_email)} account email mappings from Organizations")
+        print(f"Found {len(email_to_accounts)} unique email addresses")
+        
+        for email, accounts in email_to_accounts.items():
+            account_names = []
+            for acc_id in accounts:
+                # Find account name for better logging
+                try:
+                    account_info = org_client.describe_account(AccountId=acc_id)
+                    account_names.append(f"{acc_id} ({account_info['Account'].get('Name', 'Unknown')})")
+                except:
+                    account_names.append(acc_id)
+            print(f"Email {email} will receive events for accounts: {', '.join(account_names)}")
+        
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        if error_code == 'AccessDeniedException':
+            print("Error: Access denied when trying to access AWS Organizations. Ensure the Lambda has organizations:ListAccounts and organizations:DescribeAccount permissions.")
+        elif error_code == 'AWSOrganizationsNotInUseException':
+            print("Error: AWS Organizations is not enabled for this account.")
+        else:
+            print(f"Error accessing AWS Organizations: {error_code} - {e.response['Error']['Message']}")
+    except Exception as e:
+        print(f"Error fetching account mappings from Organizations: {str(e)}")
+        traceback.print_exc()
     
     return account_to_email, dict(email_to_accounts)
 
@@ -565,152 +635,79 @@ def lambda_handler(event, context):
                 if use_org_view:
                     print("Using AWS Health Organization View")
                 
-                    # CHANGE 1: Fetch closed events with both start and end date filters
-                    closed_filter = {
+                    # CHANGE 1: Fetch non-closed events (open and upcoming only)
+                    non_closed_filter = {
                         'startTime': {'from': formatted_start},
-                        'endTime': {'to': formatted_end},
-                        'eventStatusCodes': ['closed', 'upcoming']
+                        'eventStatusCodes': ['open', 'upcoming']  # Only non-closed events
                     }
                     
                     # Add event type categories filter if specified
                     if event_categories_to_process:
-                        closed_filter['eventTypeCategories'] = event_categories_to_process
+                        non_closed_filter['eventTypeCategories'] = event_categories_to_process
                     
-                    print(f"Fetching CLOSED events with filter: {closed_filter}")
-                    closed_response = health_client.describe_events_for_organization(
-                        filter=closed_filter,
+                    print(f"Fetching NON-CLOSED events (open/upcoming) with filter: {non_closed_filter}")
+                    response = health_client.describe_events_for_organization(
+                        filter=non_closed_filter,
                         maxResults=100
                     )
                     
-                    if 'events' in closed_response:
-                        all_events.extend(closed_response['events'])
-                        print(f"Retrieved {len(closed_response.get('events', []))} closed events")
+                    if 'events' in response:
+                        all_events.extend(response['events'])
+                        print(f"Retrieved {len(response.get('events', []))} non-closed events")
                     
-                    # Handle pagination for closed events
-                    while 'nextToken' in closed_response and closed_response['nextToken']:
-                        print(f"Found nextToken for closed events, fetching more...")
+                    # Handle pagination for non-closed events
+                    while 'nextToken' in response and response['nextToken']:
+                        print(f"Found nextToken for non-closed events, fetching more...")
                         if context.get_remaining_time_in_millis() < 15000:  # 15 seconds buffer
                             print("Approaching Lambda timeout, stopping pagination")
                             break
                             
-                        closed_response = health_client.describe_events_for_organization(
-                            filter=closed_filter,
+                        response = health_client.describe_events_for_organization(
+                            filter=non_closed_filter,
                             maxResults=100,
-                            nextToken=closed_response['nextToken']
+                            nextToken=response['nextToken']
                         )
                         
-                        if 'events' in closed_response:
-                            all_events.extend(closed_response['events'])
-                            print(f"Retrieved {len(closed_response.get('events', []))} additional closed events")
-                    
-                    # CHANGE 2: Fetch open events with only start date filter
-                    open_filter = {
-                        'startTime': {'from': formatted_start},  # Started on or after start date
-                        'eventStatusCodes': ['open']  # Only open events
-                    }
-                    
-                    # Add event type categories filter if specified
-                    if event_categories_to_process:
-                        open_filter['eventTypeCategories'] = event_categories_to_process
-                    
-                    print(f"Fetching OPEN events with filter: {open_filter}")
-                    open_response = health_client.describe_events_for_organization(
-                        filter=open_filter,
-                        maxResults=100
-                    )
-                    
-                    if 'events' in open_response:
-                        all_events.extend(open_response['events'])
-                        print(f"Retrieved {len(open_response.get('events', []))} open events")
-                    
-                    # Handle pagination for open events
-                    while 'nextToken' in open_response and open_response['nextToken']:
-                        print(f"Found nextToken for open events, fetching more...")
-                        if context.get_remaining_time_in_millis() < 15000:  # 15 seconds buffer
-                            print("Approaching Lambda timeout, stopping pagination")
-                            break
-                            
-                        open_response = health_client.describe_events_for_organization(
-                            filter=open_filter,
-                            maxResults=100,
-                            nextToken=open_response['nextToken']
-                        )
-                        
-                        if 'events' in open_response:
-                            all_events.extend(open_response['events'])
-                            print(f"Retrieved {len(open_response.get('events', []))} additional open events")
+                        if 'events' in response:
+                            all_events.extend(response['events'])
+                            print(f"Retrieved {len(response.get('events', []))} additional non-closed events")
                 
                 else:
                     print("Using AWS Health Account View")
                     
-                    # CHANGE 3: Same approach for account view - fetch closed events
-                    closed_filter = {
+                    # CHANGE 3: Same approach for account view - fetch non-closed events only
+                    non_closed_filter = {
                         'startTime': {'from': formatted_start},
-                        'endTime': {'to': formatted_end},
-                        'eventStatusCodes': ['closed', 'upcoming']
+                        'eventStatusCodes': ['open', 'upcoming']  # Only non-closed events
                     }
                     
                     # Add event type categories filter if specified
                     if event_categories_to_process:
-                        closed_filter['eventTypeCategories'] = event_categories_to_process
+                        non_closed_filter['eventTypeCategories'] = event_categories_to_process
                     
-                    print(f"Fetching CLOSED events with filter: {closed_filter}")
-                    closed_response = health_client.describe_events(
-                        filter=closed_filter,
+                    print(f"Fetching NON-CLOSED events (open/upcoming) with filter: {non_closed_filter}")
+                    response = health_client.describe_events(
+                        filter=non_closed_filter,
                         maxResults=100
                     )
                     
-                    if 'events' in closed_response:
-                        all_events.extend(closed_response['events'])
+                    if 'events' in response:
+                        all_events.extend(response['events'])
                     
-                    # Handle pagination for closed events
-                    while 'nextToken' in closed_response and closed_response['nextToken']:
+                    # Handle pagination for non-closed events
+                    while 'nextToken' in response and response['nextToken']:
                         if context.get_remaining_time_in_millis() < 15000:  # 15 seconds buffer
                             print("Approaching Lambda timeout, stopping pagination")
                             break
                             
-                        closed_response = health_client.describe_events(
-                            filter=closed_filter,
+                        response = health_client.describe_events(
+                            filter=non_closed_filter,
                             maxResults=100,
-                            nextToken=closed_response['nextToken']
+                            nextToken=response['nextToken']
                         )
                         
-                        if 'events' in closed_response:
-                            all_events.extend(closed_response['events'])
-                    
-                    # CHANGE 4: Fetch open events with only start date filter
-                    open_filter = {
-                        'startTime': {'from': formatted_start},  # Started on or after start date
-                        'eventStatusCodes': ['open']  # Only open events
-                    }
-                    
-                    # Add event type categories filter if specified
-                    if event_categories_to_process:
-                        open_filter['eventTypeCategories'] = event_categories_to_process
-                    
-                    print(f"Fetching OPEN events with filter: {open_filter}")
-                    open_response = health_client.describe_events(
-                        filter=open_filter,
-                        maxResults=100
-                    )
-                    
-                    if 'events' in open_response:
-                        all_events.extend(open_response['events'])
-                    
-                    # Handle pagination for open events
-                    while 'nextToken' in open_response and open_response['nextToken']:
-                        if context.get_remaining_time_in_millis() < 15000:  # 15 seconds buffer
-                            print("Approaching Lambda timeout, stopping pagination")
-                            break
-                            
-                        open_response = health_client.describe_events(
-                            filter=open_filter,
-                            maxResults=100,
-                            nextToken=open_response['nextToken']
-                        )
-                        
-                        if 'events' in open_response:
-                            all_events.extend(open_response['events'])
+                        if 'events' in response:
+                            all_events.extend(response['events'])
         
             except ClientError as e:
                 if e.response['Error']['Code'] == 'SubscriptionRequiredException':
@@ -1297,8 +1294,8 @@ def analyze_event_with_bedrock(bedrock_client, event_data):
                 return event_data
             except json.JSONDecodeError as e:
                 print(f"JSON parsing failed: {str(e)}")
-                print(f"Failed to parse JSON from response: {json_str[:500]}...")
-                print(f"Full response length: {len(response_text)}")
+                # print(f"Failed to parse JSON from response: {json_str[:500]}...")
+                # print(f"Full response length: {len(response_text)}")
                 
                 # Try to manually extract key fields if JSON parsing fails
                 manual_analysis = {}
@@ -1321,7 +1318,7 @@ def analyze_event_with_bedrock(bedrock_client, event_data):
                         manual_analysis[field] = field_match.group(2)
                 
                 if manual_analysis:
-                    print(f"Manually extracted fields: {manual_analysis}")
+                    # print(f"Manually extracted fields: {manual_analysis}")
                     event_data.update(manual_analysis)
                 else:
                     # Provide default values if all parsing fails
@@ -1992,7 +1989,7 @@ def generate_summary_html(total_events, event_categories, filtered_events, categ
 
 def send_account_specific_emails(events_analysis, items_count, event_categories, filtered_count, event_categories_to_process):
     """
-    Send emails grouped by recipient email address based on ACCOUNT_EMAIL_MAPPING, 
+    Send emails grouped by recipient email address based on AWS Organizations account email addresses, 
     with SES failure handling and master email with tracking columns.
     
     Args:
@@ -2006,8 +2003,8 @@ def send_account_specific_emails(events_analysis, items_count, event_categories,
         None
     """
     try:
-        # Parse account email mapping - returns both mappings
-        account_to_email, email_to_accounts = parse_account_email_mapping()
+        # Get account email mapping from AWS Organizations - returns both mappings
+        account_to_email, email_to_accounts = get_organization_account_email_mapping()
         
         # Initialize tracking for email sending results
         email_sending_results = {}  # email -> (success, error_message)
@@ -2030,7 +2027,7 @@ def send_account_specific_emails(events_analysis, items_count, event_categories,
             for event in events_analysis:
                 event['email_sent_status'] = 'Sent to default'
             
-            excel_buffer = create_excel_report_improved_with_tracking(events_analysis)
+            excel_buffer = create_excel_report_improved_with_tracking(events_analysis, include_tracking_columns=True)
             summary_html = generate_summary_html(
                 items_count, event_categories, filtered_count, 
                 event_categories_to_process, events_analysis
@@ -2062,8 +2059,8 @@ def send_account_specific_emails(events_analysis, items_count, event_categories,
                 
                 print(f"Attempting to send email to {email} for accounts [{accounts_str}] with {len(email_events)} events")
                 
-                # Create Excel report for all events going to this email with account filter info
-                excel_buffer = create_excel_report_improved_with_tracking(email_events, accounts_str)
+                # Create Excel report for all events going to this email with account filter info (no tracking columns)
+                excel_buffer = create_excel_report_improved_with_tracking(email_events, accounts_str, include_tracking_columns=False)
                 
                 # Calculate event categories for this email's events
                 email_event_categories = defaultdict(int)
@@ -2083,28 +2080,32 @@ def send_account_specific_emails(events_analysis, items_count, event_categories,
                     event_categories_to_process, email_events, accounts_str
                 )
                 
-                # Check email verification status before attempting to send
+                # Check email verification status before attempting to send (only in sandbox mode)
                 ses_client = boto3.client('ses')
                 verification_failed = False
                 verification_error = ""
                 
-                try:
-                    identity_response = ses_client.get_identity_verification_attributes(
-                        Identities=[email]
-                    )
-                    
-                    verification_status = identity_response.get('VerificationAttributes', {}).get(
-                        email, {}
-                    ).get('VerificationStatus', 'NotStarted')
-                    
-                    if verification_status != 'Success':
-                        verification_failed = True
-                        verification_error = f"Recipient email not verified (status: {verification_status})"
-                        print(f"Email verification failed for {email}: {verification_error}")
+                if should_verify_recipient_email():
+                    print(f"SES is in sandbox mode - verifying recipient email: {email}")
+                    try:
+                        identity_response = ses_client.get_identity_verification_attributes(
+                            Identities=[email]
+                        )
                         
-                except Exception as e:
-                    print(f"Warning: Could not verify recipient status for {email}: {e}")
-                    # Continue with sending - this is just a warning
+                        verification_status = identity_response.get('VerificationAttributes', {}).get(
+                            email, {}
+                        ).get('VerificationStatus', 'NotStarted')
+                        
+                        if verification_status != 'Success':
+                            verification_failed = True
+                            verification_error = f"Recipient email not verified (status: {verification_status})"
+                            print(f"Email verification failed for {email}: {verification_error}")
+                            
+                    except Exception as e:
+                        print(f"Warning: Could not verify recipient status for {email}: {e}")
+                        # Continue with sending - this is just a warning
+                else:
+                    print(f"SES is in production mode - skipping verification check for: {email}")
                 
                 # Update event status based on verification check
                 if verification_failed:
@@ -2164,7 +2165,7 @@ def send_account_specific_emails(events_analysis, items_count, event_categories,
             print(f"Sending master email with all {len(events_analysis)} events and tracking information")
             
             # Create master Excel report with tracking columns
-            master_excel_buffer = create_excel_report_improved_with_tracking(events_analysis)
+            master_excel_buffer = create_excel_report_improved_with_tracking(events_analysis, include_tracking_columns=True)
             
             # Generate master summary HTML
             master_summary_html = generate_summary_html(
@@ -2191,7 +2192,7 @@ def send_account_specific_emails(events_analysis, items_count, event_categories,
                 if 'email_sent_status' not in event:
                     event['email_sent_status'] = 'Sent to default (fallback)'
             
-            excel_buffer = create_excel_report_improved_with_tracking(events_analysis)
+            excel_buffer = create_excel_report_improved_with_tracking(events_analysis, include_tracking_columns=True)
             summary_html = generate_summary_html(
                 items_count, event_categories, filtered_count, 
                 event_categories_to_process, events_analysis
@@ -2222,24 +2223,21 @@ def send_ses_email_with_attachment_to_recipient_with_error_handling(html_content
         sender = os.environ['SENDER_EMAIL']
         recipients = [recipient_email.strip()]
         
-        # Create account identifier and email subject
-        account_count = len([acc.strip() for acc in accounts_str.split(',')])
-        accounts_filename = "1-account" if account_count == 1 else f"{account_count}-accounts"
-        
+        # Create email subject
         critical_count = event_categories.get('critical', 0)
         high_risk_count = sum(1 for event in events_analysis if event.get('risk_level', '').lower() == 'high')
         
         if critical_count > 0:
-            subject = f"{customer_name} [CRITICAL] AWS Health Events Analysis - {accounts_filename} - {critical_count} Critical, {high_risk_count} High Risk Events"
+            subject = f"{customer_name} [CRITICAL] AWS Health Events Analysis - {critical_count} Critical, {high_risk_count} High Risk Events"
         elif high_risk_count > 0:
-            subject = f"{customer_name} [HIGH RISK] AWS Health Events Analysis - {accounts_filename} - {high_risk_count} High Risk Events"
+            subject = f"{customer_name} [HIGH RISK] AWS Health Events Analysis - {high_risk_count} High Risk Events"
         else:
-            subject = f"{customer_name} AWS Health Events Analysis - {accounts_filename} - {total_events} Events"
+            subject = f"{customer_name} AWS Health Events Analysis - {total_events} Events"
         
         # Generate Excel filename
         current_date = datetime.now().strftime('%Y-%m-%d')
         current_time = datetime.now().strftime('%H-%M')
-        excel_filename = f"AWS_Health_Events_Analysis_{accounts_filename}_{current_date}_{current_time}.xlsx"
+        excel_filename = f"AWS_Health_Events_Analysis_{current_date}_{current_time}.xlsx"
         
         # Create SES client
         ses_client = boto3.client('ses')
@@ -2260,22 +2258,26 @@ def send_ses_email_with_attachment_to_recipient_with_error_handling(html_content
             }
         }
         
-        # Check if recipient email is verified before sending
-        try:
-            identity_response = ses_client.get_identity_verification_attributes(
-                Identities=[recipient_email]
-            )
-            
-            verification_status = identity_response.get('VerificationAttributes', {}).get(
-                recipient_email, {}
-            ).get('VerificationStatus', 'NotStarted')
-            
-            if verification_status != 'Success':
-                return False, f"Recipient email not verified (status: {verification_status})"
+        # Check if recipient email is verified before sending (only in sandbox mode)
+        if should_verify_recipient_email():
+            print(f"SES is in sandbox mode - verifying recipient email: {recipient_email}")
+            try:
+                identity_response = ses_client.get_identity_verification_attributes(
+                    Identities=[recipient_email]
+                )
                 
-        except Exception as e:
-            print(f"Warning: Could not verify recipient status for {recipient_email}: {e}")
-            # Continue with sending - this is just a warning, don't fail the send
+                verification_status = identity_response.get('VerificationAttributes', {}).get(
+                    recipient_email, {}
+                ).get('VerificationStatus', 'NotStarted')
+                
+                if verification_status != 'Success':
+                    return False, f"Recipient email not verified (status: {verification_status})"
+                    
+            except Exception as e:
+                print(f"Warning: Could not verify recipient status for {recipient_email}: {e}")
+                # Continue with sending - this is just a warning, don't fail the send
+        else:
+            print(f"SES is in production mode - skipping verification check for: {recipient_email}")
         
         # Send email with SES error handling
         response = ses_client.send_raw_email(**msg_raw)
@@ -2392,27 +2394,31 @@ def send_ses_email_with_attachment_master(html_content, excel_buffer, total_even
             }
         }
         
-        # Check if recipient emails are verified before sending
+        # Check if recipient emails are verified before sending (only in sandbox mode)
         unverified_recipients = []
-        for recipient in recipients:
-            try:
-                identity_response = ses_client.get_identity_verification_attributes(
-                    Identities=[recipient]
-                )
-                
-                verification_status = identity_response.get('VerificationAttributes', {}).get(
-                    recipient, {}
-                ).get('VerificationStatus', 'NotStarted')
-                
-                if verification_status != 'Success':
-                    unverified_recipients.append(f"{recipient} (status: {verification_status})")
+        if should_verify_recipient_email():
+            print("SES is in sandbox mode - verifying master email recipients")
+            for recipient in recipients:
+                try:
+                    identity_response = ses_client.get_identity_verification_attributes(
+                        Identities=[recipient]
+                    )
                     
-            except Exception as e:
-                print(f"Warning: Could not verify recipient status for {recipient}: {e}")
-                # Continue with sending - this is just a warning
-        
-        if unverified_recipients:
-            print(f"Warning: Some master email recipients are not verified: {', '.join(unverified_recipients)}")
+                    verification_status = identity_response.get('VerificationAttributes', {}).get(
+                        recipient, {}
+                    ).get('VerificationStatus', 'NotStarted')
+                    
+                    if verification_status != 'Success':
+                        unverified_recipients.append(f"{recipient} (status: {verification_status})")
+                        
+                except Exception as e:
+                    print(f"Warning: Could not verify recipient status for {recipient}: {e}")
+                    # Continue with sending - this is just a warning
+            
+            if unverified_recipients:
+                print(f"Warning: Some master email recipients are not verified: {', '.join(unverified_recipients)}")
+        else:
+            print("SES is in production mode - skipping verification checks for master email recipients")
         
         # Send email
         response = ses_client.send_raw_email(**msg_raw)
@@ -2456,13 +2462,14 @@ def send_ses_email_with_attachment_master(html_content, excel_buffer, total_even
         traceback.print_exc()
 
 
-def create_excel_report_improved_with_tracking(events_analysis, account_filter_info=None):
+def create_excel_report_improved_with_tracking(events_analysis, account_filter_info=None, include_tracking_columns=True):
     """
-    Create an improved Excel report with detailed event analysis and tracking columns
+    Create an improved Excel report with detailed event analysis and optional tracking columns
     
     Args:
         events_analysis (list): List of analyzed events data
         account_filter_info (str, optional): Comma-separated account IDs if filtered for specific accounts
+        include_tracking_columns (bool): Whether to include "Mapped Email" and "Email Status" columns
         
     Returns:
         BytesIO: Excel file as bytes
@@ -2521,7 +2528,7 @@ def create_excel_report_improved_with_tracking(events_analysis, account_filter_i
         for i, account_id in enumerate(account_ids, start=11):
             summary_sheet[f'A{i}'] = account_id
     
-    # Add headers to events sheet with tracking columns
+    # Add headers to events sheet with optional tracking columns
     headers = [
         "Event ARN",
         "Event Type", 
@@ -2539,10 +2546,15 @@ def create_excel_report_improved_with_tracking(events_analysis, account_filter_i
         "Required Actions", 
         "Impact Analysis", 
         "Consequences If Ignored", 
-        "Affected Resources",
-        "Mapped Email",  # New tracking column
-        "Email Status"   # New tracking column
+        "Affected Resources"
     ]
+    
+    # Add tracking columns only if requested (for master email)
+    if include_tracking_columns:
+        headers.extend([
+            "Mapped Email",  # Tracking column
+            "Email Status"   # Tracking column
+        ])
     
     for col_num, header in enumerate(headers, 1):
         cell = events_sheet.cell(row=1, column=col_num)
@@ -2576,26 +2588,30 @@ def create_excel_report_improved_with_tracking(events_analysis, account_filter_i
         events_sheet.cell(row=row_num, column=16).value = event.get('consequences_if_ignored', '')
         events_sheet.cell(row=row_num, column=17).value = event.get('affected_resources', 'None')
         
-        # Add tracking columns
-        events_sheet.cell(row=row_num, column=18).value = event.get('mapped_email', 'No mapping')
-        events_sheet.cell(row=row_num, column=19).value = event.get('email_sent_status', 'Unknown')
+        # Add tracking columns only if requested
+        if include_tracking_columns:
+            events_sheet.cell(row=row_num, column=18).value = event.get('mapped_email', 'No mapping')
+            events_sheet.cell(row=row_num, column=19).value = event.get('email_sent_status', 'Unknown')
         
         # Color coding based on risk level
         risk_level = event.get('risk_level', 'low').lower()
         is_critical = event.get('critical', False)
         
+        # Determine the number of columns based on whether tracking columns are included
+        max_col = 19 if include_tracking_columns else 17
+        
         if is_critical:
-            for col_num in range(1, 20):
+            for col_num in range(1, max_col + 1):
                 events_sheet.cell(row=row_num, column=col_num).fill = PatternFill(
                     start_color="FFCCCC", end_color="FFCCCC", fill_type="solid"
                 )
         elif risk_level == 'high':
-            for col_num in range(1, 20):
+            for col_num in range(1, max_col + 1):
                 events_sheet.cell(row=row_num, column=col_num).fill = PatternFill(
                     start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"
                 )
         elif risk_level == 'medium':
-            for col_num in range(1, 20):
+            for col_num in range(1, max_col + 1):
                 events_sheet.cell(row=row_num, column=col_num).fill = PatternFill(
                     start_color="E6F2FF", end_color="E6F2FF", fill_type="solid"
                 )
@@ -2616,8 +2632,11 @@ def create_excel_report_improved_with_tracking(events_analysis, account_filter_i
     
     # Set specific widths for key columns
     events_sheet.column_dimensions['G'].width = 60  # Description column
-    events_sheet.column_dimensions['R'].width = 30  # Mapped Email column
-    events_sheet.column_dimensions['S'].width = 40  # Email Status column
+    
+    # Set tracking column widths only if they exist
+    if include_tracking_columns:
+        events_sheet.column_dimensions['R'].width = 30  # Mapped Email column
+        events_sheet.column_dimensions['S'].width = 40  # Email Status column
     
     # Create critical events sheet with tracking columns
     critical_sheet = wb.create_sheet(title="Critical Events")
@@ -2633,7 +2652,9 @@ def create_excel_report_improved_with_tracking(events_analysis, account_filter_i
     critical_events = [event for event in events_analysis if event.get('critical', False)]
     if not critical_events:
         critical_sheet.cell(row=2, column=1).value = "No critical events found"
-        critical_sheet.merge_cells('A2:S2')  # Updated to include new columns
+        # Merge cells based on whether tracking columns are included
+        merge_range = 'A2:S2' if include_tracking_columns else 'A2:Q2'
+        critical_sheet.merge_cells(merge_range)
         critical_sheet.cell(row=2, column=1).alignment = Alignment(horizontal='center')
     else:
         for row_num, event in enumerate(critical_events, 2):
@@ -2661,12 +2682,14 @@ def create_excel_report_improved_with_tracking(events_analysis, account_filter_i
             critical_sheet.cell(row=row_num, column=16).value = event.get('consequences_if_ignored', '')
             critical_sheet.cell(row=row_num, column=17).value = event.get('affected_resources', 'None')
             
-            # Add tracking columns
-            critical_sheet.cell(row=row_num, column=18).value = event.get('mapped_email', 'No mapping')
-            critical_sheet.cell(row=row_num, column=19).value = event.get('email_sent_status', 'Unknown')
+            # Add tracking columns only if requested
+            if include_tracking_columns:
+                critical_sheet.cell(row=row_num, column=18).value = event.get('mapped_email', 'No mapping')
+                critical_sheet.cell(row=row_num, column=19).value = event.get('email_sent_status', 'Unknown')
             
             # Apply critical highlighting
-            for col_num in range(1, 20):
+            max_col = 19 if include_tracking_columns else 17
+            for col_num in range(1, max_col + 1):
                 critical_sheet.cell(row=row_num, column=col_num).fill = PatternFill(
                     start_color="FFCCCC", end_color="FFCCCC", fill_type="solid"
                 )
@@ -2687,8 +2710,11 @@ def create_excel_report_improved_with_tracking(events_analysis, account_filter_i
     
     # Set specific widths for key columns in critical sheet
     critical_sheet.column_dimensions['G'].width = 60  # Description column
-    critical_sheet.column_dimensions['R'].width = 30  # Mapped Email column
-    critical_sheet.column_dimensions['S'].width = 40  # Email Status column
+    
+    # Set tracking column widths only if they exist
+    if include_tracking_columns:
+        critical_sheet.column_dimensions['R'].width = 30  # Mapped Email column
+        critical_sheet.column_dimensions['S'].width = 40  # Email Status column
     
     # Create risk analysis sheet with full Bedrock analysis
     analysis_sheet = wb.create_sheet(title="Risk Analysis")
@@ -2795,8 +2821,6 @@ def send_ses_email_with_attachment(html_content, excel_buffer, total_events, eve
         
         # Create email subject with counts
         critical_count = event_categories.get('critical', 0)
-        #high_risk_count = event_categories.get('high_risk', 0)
-        #high_risk_count = event_categories.get(('risk_level', '').lower() == 'high'),0)
         high_risk_count = sum(1 for event in events_analysis if event.get('risk_level', '').lower() == 'high')
         
         if critical_count > 0:
@@ -2807,13 +2831,38 @@ def send_ses_email_with_attachment(html_content, excel_buffer, total_events, eve
             subject = f"{customer_name} AWS Health Events Analysis - {total_events} Events"
         
         # Generate Excel filename
-                # Generate Excel filename
         current_date = datetime.now().strftime('%Y-%m-%d')
         current_time = datetime.now().strftime('%H-%M')
         excel_filename = EXCEL_FILENAME_TEMPLATE.format(date=current_date, time=current_time)
         
         # Create SES client
         ses_client = boto3.client('ses')
+        
+        # Check if recipient emails are verified before sending (only in sandbox mode)
+        if should_verify_recipient_email():
+            print("SES is in sandbox mode - verifying recipient emails")
+            unverified_recipients = []
+            for recipient in recipients:
+                try:
+                    identity_response = ses_client.get_identity_verification_attributes(
+                        Identities=[recipient]
+                    )
+                    
+                    verification_status = identity_response.get('VerificationAttributes', {}).get(
+                        recipient, {}
+                    ).get('VerificationStatus', 'NotStarted')
+                    
+                    if verification_status != 'Success':
+                        unverified_recipients.append(f"{recipient} (status: {verification_status})")
+                        
+                except Exception as e:
+                    print(f"Warning: Could not verify recipient status for {recipient}: {e}")
+            
+            if unverified_recipients:
+                print(f"Warning: Some recipients are not verified: {', '.join(unverified_recipients)}")
+                print("Email sending may fail for unverified recipients in sandbox mode")
+        else:
+            print("SES is in production mode - skipping verification checks for recipients")
         
         # Create message container
         message = {

@@ -63,11 +63,14 @@ Parameters:
     Description: (Optional) Prefix for S3 objects in the bucket
     Default: ''
     
-  # Account email mapping parameter
-  AccountEmailMapping:
+  # Organization account email mapping parameter
+  UseOrganizationAccountEmailMapping:
     Type: String
-    Description: (Optional) Mapping of AWS account IDs to email addresses (format = account1:email1@example.com,account2:email2@example.com)
-    Default: ''
+    Description: Enable account-specific email routing using AWS Organizations account email addresses (true/false)
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
     
   # S3 health events override parameter (for testing only)
   OverrideS3HealthEventsArn:
@@ -84,10 +87,10 @@ Resources:
       Description: Dependencies for Health Events Analyzer
       ContentUri: ./layer
       CompatibleRuntimes:
-        - python3.9
+        - python3.11
       RetentionPolicy: Retain
     Metadata:
-      BuildMethod: python3.9
+      BuildMethod: python3.11
       BuildArchitecture: x86_64
       RequirementsPath: requirements.txt
 
@@ -119,6 +122,7 @@ Resources:
                   - ses:SendEmail
                   - ses:SendRawEmail
                   - ses:GetIdentityVerificationAttributes
+                  - ses:GetSendQuota
                   - cloudwatch:PutMetricData
                   - health:DescribeEvents
                   - health:DescribeEventDetails
@@ -188,7 +192,7 @@ Resources:
             except Exception as e:
                 cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
       Handler: index.handler
-      Runtime: python3.9
+      Runtime: python3.11
       Timeout: 30
 
   # S3 Bucket for temporary report storage with dynamic naming and 90-day lifecycle
@@ -215,7 +219,7 @@ Resources:
       FunctionName: !Sub 'aws-health-events-analyzer-${AWS::StackName}'
       Handler: index.lambda_handler
       Role: !GetAtt HealthEventsAnalyzerRole.Arn
-      Runtime: python3.9
+      Runtime: python3.11
       CodeUri: ./src/
       MemorySize: 2048
       Timeout: 900  # 15 minutes in seconds
@@ -239,8 +243,8 @@ Resources:
           BEDROCK_MAX_TOKENS: 4000
           BEDROCK_TEMPERATURE: 0.3
           BEDROCK_TOP_P: !Ref BedrockTopP
-          # Account email mapping
-          ACCOUNT_EMAIL_MAPPING: !Ref AccountEmailMapping
+          # Organization account email mapping
+          USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING: !Ref UseOrganizationAccountEmailMapping
           # S3 health events override (for testing)
           OVERRIDE_S3_HEALTH_EVENTS_ARN: !Ref OverrideS3HealthEventsArn
 
