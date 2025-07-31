@@ -198,6 +198,206 @@ def parse_health_events_file(file_buffer, filename):
         raise
 
 
+def _get_column_mapping():
+    """
+    Get the standard column mapping for health events
+    
+    Returns:
+        dict: Mapping from file column names to Health API field names
+    """
+    return {
+        'domain': 'domain',  # Keep domain for reference
+        'account_id': 'accountId',
+        'event_arn': 'arn',
+        'event_type_code': 'eventTypeCode',
+        'event_type_category': 'eventTypeCategory',
+        'service': 'service',
+        'region': 'region',
+        'availability_zone': 'availabilityZone',
+        'start_time': 'startTime',
+        'end_time': 'endTime',
+        'last_updated_time': 'lastUpdatedTime',
+        'status_code': 'statusCode',
+        'event_scope_code': 'eventScopeCode',
+        'affected_entities_count': 'affectedEntitiesCount',
+        'affected_entities': 'affectedEntities',
+        'details': 'details'  # Special handling - extracts description only
+    }
+
+
+def _read_csv_data(csv_buffer):
+    """
+    Read CSV data and return headers and rows
+    
+    Args:
+        csv_buffer (BytesIO): CSV file content
+        
+    Returns:
+        tuple: (headers, rows_iterator)
+    """
+    import csv
+    
+    csv_buffer.seek(0)
+    csv_content = csv_buffer.read().decode('utf-8-sig')  # Handle BOM if present
+    csv_reader = csv.DictReader(csv_content.splitlines())
+    
+    headers = list(csv_reader.fieldnames)
+    rows = [(row_num, row) for row_num, row in enumerate(csv_reader, start=2)]
+    
+    return headers, rows
+
+
+def _read_excel_data(excel_buffer):
+    """
+    Read Excel data and return headers and rows
+    
+    Args:
+        excel_buffer (BytesIO): Excel file content
+        
+    Returns:
+        tuple: (headers, rows_iterator)
+    """
+    # Load the workbook
+    workbook = load_workbook(excel_buffer, data_only=True)
+    
+    # Try to find the worksheet with health events data
+    sheet_names_to_try = ['Sheet1', 'Events', 'Health Events', 'AWS Health Events']
+    worksheet = None
+    
+    for sheet_name in sheet_names_to_try:
+        if sheet_name in workbook.sheetnames:
+            worksheet = workbook[sheet_name]
+            break
+    
+    if worksheet is None:
+        worksheet = workbook.active
+        print(f"Using worksheet: {worksheet.title}")
+    else:
+        print(f"Found worksheet: {worksheet.title}")
+    
+    # Read the header row
+    headers = []
+    for cell in worksheet[1]:
+        if cell.value:
+            headers.append(str(cell.value).strip())
+        else:
+            headers.append('')
+    
+    # Convert Excel rows to dictionary format similar to CSV
+    rows = []
+    for row_num, row in enumerate(worksheet.iter_rows(min_row=2, values_only=True), start=2):
+        if not any(row):  # Skip empty rows
+            continue
+        
+        # Create dictionary mapping headers to values
+        row_dict = {}
+        for i, header in enumerate(headers):
+            if i < len(row) and row[i] is not None:
+                row_dict[header] = row[i]
+        
+        rows.append((row_num, row_dict))
+    
+    return headers, rows
+
+
+def _process_health_event_row(row_data, row_num, column_mapping, file_type):
+    """
+    Process a single row of health event data into Health API format
+    
+    Args:
+        row_data (dict): Row data as dictionary
+        row_num (int): Row number for error reporting
+        column_mapping (dict): Column mapping dictionary
+        file_type (str): 'csv' or 'excel' for error messages
+        
+    Returns:
+        dict: Processed health event
+    """
+    import ast
+    
+    event = {}
+    
+    # Extract fields based on mapping
+    for file_col, api_field in column_mapping.items():
+        if file_col in row_data and row_data[file_col] is not None:
+            value = str(row_data[file_col]).strip()
+            if not value:  # Skip empty values
+                continue
+            
+            # Handle special fields that need parsing
+            if file_col == 'details' and value:
+                try:
+                    # Parse the details field which contains a dictionary as string
+                    details_dict = ast.literal_eval(value)
+                    if isinstance(details_dict, dict):
+                        # Extract description from details - this is the main field we need
+                        if 'description' in details_dict:
+                            event['eventDescription'] = details_dict['description']
+                        # Also extract affected_entities if present in details and not already set
+                        if 'affected_entities' in details_dict and 'affectedEntities' not in event:
+                            event['affectedEntities'] = details_dict['affected_entities']
+                        # Don't store the full details blob to keep data size manageable
+                except (ValueError, SyntaxError) as e:
+                    print(f"Warning: Could not parse details field for row {row_num}: {e}")
+                    # Try to extract at least the description if it's a simple string
+                    if 'description' in value.lower():
+                        event['eventDescription'] = value[:1000] + "..." if len(value) > 1000 else value
+                    else:
+                        event['eventDescription'] = value[:500] + "..." if len(value) > 500 else value
+            elif file_col == 'affected_entities' and value:
+                try:
+                    # This might be a string representation of a list or just a string
+                    if value.startswith('[') or value.startswith('arn:'):
+                        event[api_field] = value
+                    else:
+                        event[api_field] = value
+                except Exception as e:
+                    print(f"Warning: Could not parse affected_entities for row {row_num}: {e}")
+                    event[api_field] = value
+            elif file_col == 'affected_entities_count' and value:
+                try:
+                    # Convert to integer
+                    event[api_field] = int(value)
+                except ValueError:
+                    print(f"Warning: Could not convert affected_entities_count to int for row {row_num}: {value}")
+                    event[api_field] = value
+            else:
+                event[api_field] = value
+    
+    # Set default values for required fields if missing
+    if 'arn' not in event:
+        event['arn'] = f"arn:aws:health:global::event/{file_type}-event-{row_num}"
+    
+    if 'eventTypeCode' not in event:
+        event['eventTypeCode'] = 'UNKNOWN_EVENT_TYPE'
+    
+    if 'service' not in event:
+        event['service'] = 'unknown'
+    
+    if 'region' not in event:
+        event['region'] = 'global'
+    
+    if 'statusCode' not in event:
+        event['statusCode'] = 'closed'
+    
+    if 'eventTypeCategory' not in event:
+        event['eventTypeCategory'] = 'accountNotification'
+    
+    # Handle datetime fields
+    current_time = datetime.now(timezone.utc).isoformat()
+    if 'startTime' not in event:
+        event['startTime'] = current_time
+    
+    if 'lastUpdatedTime' not in event:
+        event['lastUpdatedTime'] = current_time
+    
+    # Ensure accountId is set
+    if 'accountId' not in event:
+        event['accountId'] = '123456789012'  # Default test account
+    
+    return event
+
+
 def parse_csv_health_events(csv_buffer):
     """
     Parse CSV file containing health events and convert to Health API format
@@ -208,137 +408,35 @@ def parse_csv_health_events(csv_buffer):
     Returns:
         list: List of health events in Health API format
     """
-    import csv
-    import ast
-    
     try:
         print("Parsing CSV file for health events...")
         
-        # Read CSV content
-        csv_buffer.seek(0)
-        csv_content = csv_buffer.read().decode('utf-8-sig')  # Handle BOM if present
-        csv_reader = csv.DictReader(csv_content.splitlines())
+        # Read CSV data
+        headers, rows = _read_csv_data(csv_buffer)
+        column_mapping = _get_column_mapping()
         
-        # Map CSV column names to Health API field names based on your actual CSV structure
-        column_mapping = {
-            'domain': 'domain',  # Keep domain for reference
-            'account_id': 'accountId',
-            'event_arn': 'arn',
-            'event_type_code': 'eventTypeCode',
-            'event_type_category': 'eventTypeCategory',
-            'service': 'service',
-            'region': 'region',
-            'availability_zone': 'availabilityZone',
-            'start_time': 'startTime',
-            'end_time': 'endTime',
-            'last_updated_time': 'lastUpdatedTime',
-            'status_code': 'statusCode',
-            'event_scope_code': 'eventScopeCode',
-            'affected_entities_count': 'affectedEntitiesCount',
-            'affected_entities': 'affectedEntities',
-            'details': 'details'  # Special handling - extracts description only
-        }
-        
-        print(f"CSV headers found: {list(csv_reader.fieldnames)}")
+        print(f"CSV headers found: {headers}")
         
         # Validate that we have the expected columns
         expected_columns = ['account_id', 'event_arn', 'event_type_code', 'service']
-        missing_columns = [col for col in expected_columns if col not in csv_reader.fieldnames]
+        missing_columns = [col for col in expected_columns if col not in headers]
         if missing_columns:
             print(f"Warning: Missing expected columns: {missing_columns}")
         
-        # Parse events from CSV rows
+        # Process each row
         events = []
-        for row_num, row in enumerate(csv_reader, start=2):
-            if not any(row.values()):  # Skip empty rows
+        for row_num, row_data in rows:
+            if not any(row_data.values()):  # Skip empty rows
                 continue
-                
-            event = {}
             
-            # Extract fields based on mapping
-            for csv_col, api_field in column_mapping.items():
-                if csv_col in row and row[csv_col] is not None:
-                    value = str(row[csv_col]).strip()
-                    if not value:  # Skip empty values
-                        continue
-                    
-                    # Handle special fields that need parsing
-                    if csv_col == 'details' and value:
-                        try:
-                            # Parse the details field which contains a dictionary as string
-                            details_dict = ast.literal_eval(value)
-                            if isinstance(details_dict, dict):
-                                # Extract description from details - this is the main field we need
-                                if 'description' in details_dict:
-                                    event['eventDescription'] = details_dict['description']
-                                # Also extract affected_entities if present in details and not already set
-                                if 'affected_entities' in details_dict and 'affectedEntities' not in event:
-                                    event['affectedEntities'] = details_dict['affected_entities']
-                                # Don't store the full details blob to keep data size manageable
-                        except (ValueError, SyntaxError) as e:
-                            print(f"Warning: Could not parse details field for row {row_num}: {e}")
-                            # Try to extract at least the description if it's a simple string
-                            if 'description' in value.lower():
-                                event['eventDescription'] = value[:1000] + "..." if len(value) > 1000 else value
-                            else:
-                                event['eventDescription'] = value[:500] + "..." if len(value) > 500 else value
-                    elif csv_col == 'affected_entities' and value:
-                        try:
-                            # This might be a string representation of a list or just a string
-                            if value.startswith('[') or value.startswith('arn:'):
-                                event[api_field] = value
-                            else:
-                                event[api_field] = value
-                        except Exception as e:
-                            print(f"Warning: Could not parse affected_entities for row {row_num}: {e}")
-                            event[api_field] = value
-                    elif csv_col == 'affected_entities_count' and value:
-                        try:
-                            # Convert to integer
-                            event[api_field] = int(value)
-                        except ValueError:
-                            print(f"Warning: Could not convert affected_entities_count to int for row {row_num}: {value}")
-                            event[api_field] = value
-                    else:
-                        event[api_field] = value
-            
-            # Set default values for required fields if missing
-            if 'arn' not in event:
-                event['arn'] = f"arn:aws:health:global::event/csv-event-{row_num}"
-            
-            if 'eventTypeCode' not in event:
-                event['eventTypeCode'] = 'UNKNOWN_EVENT_TYPE'
-            
-            if 'service' not in event:
-                event['service'] = 'unknown'
-            
-            if 'region' not in event:
-                event['region'] = 'global'
-            
-            if 'statusCode' not in event:
-                event['statusCode'] = 'closed'
-            
-            if 'eventTypeCategory' not in event:
-                event['eventTypeCategory'] = 'accountNotification'
-            
-            # Handle datetime fields - they should already be in ISO format from your CSV
-            current_time = datetime.now(timezone.utc).isoformat()
-            if 'startTime' not in event:
-                event['startTime'] = current_time
-            
-            if 'lastUpdatedTime' not in event:
-                event['lastUpdatedTime'] = current_time
-            
-            # Ensure accountId is set
-            if 'accountId' not in event:
-                event['accountId'] = '123456789012'  # Default test account
-            
+            event = _process_health_event_row(row_data, row_num, column_mapping, 'csv')
             events.append(event)
-            
+        
         print(f"Parsed {len(events)} events from CSV file")
         
         # Log first event for debugging
         if events:
+            print(f"Sample event keys: {list(events[0].keys())}")
             print(f"Sample event: {json.dumps(events[0], indent=2, default=str)}")
         
         return events
@@ -362,118 +460,33 @@ def parse_excel_health_events(excel_buffer):
     try:
         print("Parsing Excel file for health events...")
         
-        # Load the workbook
-        workbook = load_workbook(excel_buffer, data_only=True)
-        
-        # Try to find the worksheet with health events data
-        # Common sheet names to look for
-        sheet_names_to_try = ['Sheet1', 'Events', 'Health Events', 'AWS Health Events']
-        worksheet = None
-        
-        for sheet_name in sheet_names_to_try:
-            if sheet_name in workbook.sheetnames:
-                worksheet = workbook[sheet_name]
-                break
-        
-        if worksheet is None:
-            # Use the first sheet if no common names found
-            worksheet = workbook.active
-            print(f"Using worksheet: {worksheet.title}")
-        else:
-            print(f"Found worksheet: {worksheet.title}")
-        
-        # Read the header row to understand the structure
-        headers = []
-        for cell in worksheet[1]:
-            if cell.value:
-                headers.append(str(cell.value).strip())
-            else:
-                headers.append('')
+        # Read Excel data
+        headers, rows = _read_excel_data(excel_buffer)
+        column_mapping = _get_column_mapping()
         
         print(f"Excel headers found: {headers}")
         
-        # Map common Excel column names to Health API field names
-        column_mapping = {
-            'Event ARN': 'arn',
-            'Event Type': 'eventTypeCode',
-            'Event Type Code': 'eventTypeCode',
-            'Service': 'service',
-            'Region': 'region',
-            'Start Time': 'startTime',
-            'End Time': 'endTime',
-            'Last Update Time': 'lastUpdatedTime',
-            'Status': 'statusCode',
-            'Event Status': 'statusCode',
-            'Category': 'eventTypeCategory',
-            'Event Category': 'eventTypeCategory',
-            'Event Type Category': 'eventTypeCategory',
-            'Description': 'eventDescription',
-            'Event Description': 'eventDescription',
-            'Account ID': 'accountId',
-            'Account': 'accountId',
-            'Affected Account': 'accountId'
-        }
+        # Validate that we have the expected columns
+        expected_columns = ['account_id', 'event_arn', 'event_type_code', 'service']
+        missing_columns = [col for col in expected_columns if col not in headers]
+        if missing_columns:
+            print(f"Warning: Missing expected columns: {missing_columns}")
         
-        # Create field index mapping
-        field_indices = {}
-        for i, header in enumerate(headers):
-            if header in column_mapping:
-                field_indices[column_mapping[header]] = i
-                print(f"Mapped column '{header}' to field '{column_mapping[header]}' at index {i}")
-        
-        # Parse events from rows
+        # Process each row
         events = []
-        for row_num, row in enumerate(worksheet.iter_rows(min_row=2, values_only=True), start=2):
-            if not any(row):  # Skip empty rows
+        for row_num, row_data in rows:
+            if not any(row_data.values()):  # Skip empty rows
                 continue
-                
-            event = {}
             
-            # Extract fields based on mapping
-            for field, index in field_indices.items():
-                if index < len(row) and row[index] is not None:
-                    value = str(row[index]).strip()
-                    if value:
-                        event[field] = value
-            
-            # Set default values for required fields if missing
-            if 'arn' not in event:
-                event['arn'] = f"arn:aws:health:global::event/test-event-{row_num}"
-            
-            if 'eventTypeCode' not in event:
-                event['eventTypeCode'] = 'UNKNOWN_EVENT_TYPE'
-            
-            if 'service' not in event:
-                event['service'] = 'unknown'
-            
-            if 'region' not in event:
-                event['region'] = 'global'
-            
-            if 'statusCode' not in event:
-                event['statusCode'] = 'closed'
-            
-            if 'eventTypeCategory' not in event:
-                event['eventTypeCategory'] = 'accountNotification'
-            
-            # Handle datetime fields
-            current_time = datetime.now(timezone.utc).isoformat()
-            if 'startTime' not in event:
-                event['startTime'] = current_time
-            
-            if 'lastUpdatedTime' not in event:
-                event['lastUpdatedTime'] = current_time
-            
-            # Ensure accountId is set
-            if 'accountId' not in event:
-                event['accountId'] = '123456789012'  # Default test account
-            
+            event = _process_health_event_row(row_data, row_num, column_mapping, 'excel')
             events.append(event)
-            
+        
         print(f"Parsed {len(events)} events from Excel file")
         
         # Log first event for debugging
         if events:
-            print(f"Sample event: {json.dumps(events[0], indent=2)}")
+            print(f"Sample event keys: {list(events[0].keys())}")
+            print(f"Sample event: {json.dumps(events[0], indent=2, default=str)}")
         
         return events
         
@@ -2049,8 +2062,8 @@ def send_account_specific_emails(events_analysis, items_count, event_categories,
                 
                 print(f"Attempting to send email to {email} for accounts [{accounts_str}] with {len(email_events)} events")
                 
-                # Create Excel report for all events going to this email
-                excel_buffer = create_excel_report_improved(email_events)
+                # Create Excel report for all events going to this email with account filter info
+                excel_buffer = create_excel_report_improved_with_tracking(email_events, accounts_str)
                 
                 # Calculate event categories for this email's events
                 email_event_categories = defaultdict(int)
@@ -2209,30 +2222,24 @@ def send_ses_email_with_attachment_to_recipient_with_error_handling(html_content
         sender = os.environ['SENDER_EMAIL']
         recipients = [recipient_email.strip()]
         
-        # Create email subject with counts and account IDs
+        # Create account identifier and email subject
+        account_count = len([acc.strip() for acc in accounts_str.split(',')])
+        accounts_filename = "1-account" if account_count == 1 else f"{account_count}-accounts"
+        
         critical_count = event_categories.get('critical', 0)
         high_risk_count = sum(1 for event in events_analysis if event.get('risk_level', '').lower() == 'high')
         
-        # Create account identifier for subject - use "Accounts" if multiple, "Account" if single
-        account_list = [acc.strip() for acc in accounts_str.split(',')]
-        if len(account_list) > 1:
-            account_identifier = f"Accounts [{accounts_str}]"
-        else:
-            account_identifier = f"Account {accounts_str}"
-        
         if critical_count > 0:
-            subject = f"{customer_name} [CRITICAL] AWS Health Events Analysis - {account_identifier} - {critical_count} Critical, {high_risk_count} High Risk Events"
+            subject = f"{customer_name} [CRITICAL] AWS Health Events Analysis - {accounts_filename} - {critical_count} Critical, {high_risk_count} High Risk Events"
         elif high_risk_count > 0:
-            subject = f"{customer_name} [HIGH RISK] AWS Health Events Analysis - {account_identifier} - {high_risk_count} High Risk Events"
+            subject = f"{customer_name} [HIGH RISK] AWS Health Events Analysis - {accounts_filename} - {high_risk_count} High Risk Events"
         else:
-            subject = f"{customer_name} AWS Health Events Analysis - {account_identifier} - {total_events} Events"
+            subject = f"{customer_name} AWS Health Events Analysis - {accounts_filename} - {total_events} Events"
         
-        # Generate Excel filename with account IDs (sanitize for filename)
+        # Generate Excel filename
         current_date = datetime.now().strftime('%Y-%m-%d')
-        current_time = datetime.now().strftime('%H-%M-%S')
-        # Replace commas and spaces with underscores for filename safety
-        accounts_filename = accounts_str.replace(',', '_').replace(' ', '')
-        excel_filename = f"AWS_Health_Events_Analysis_Accounts_{accounts_filename}_{current_date}_{current_time}.xlsx"
+        current_time = datetime.now().strftime('%H-%M')
+        excel_filename = f"AWS_Health_Events_Analysis_{accounts_filename}_{current_date}_{current_time}.xlsx"
         
         # Create SES client
         ses_client = boto3.client('ses')
@@ -2363,7 +2370,7 @@ def send_ses_email_with_attachment_master(html_content, excel_buffer, total_even
         
         # Generate Excel filename
         current_date = datetime.now().strftime('%Y-%m-%d')
-        current_time = datetime.now().strftime('%H-%M-%S')
+        current_time = datetime.now().strftime('%H-%M')
         excel_filename = f"AWS_Health_Events_Analysis_MASTER_{current_date}_{current_time}.xlsx"
         
         # Create SES client
@@ -2449,12 +2456,13 @@ def send_ses_email_with_attachment_master(html_content, excel_buffer, total_even
         traceback.print_exc()
 
 
-def create_excel_report_improved_with_tracking(events_analysis):
+def create_excel_report_improved_with_tracking(events_analysis, account_filter_info=None):
     """
     Create an improved Excel report with detailed event analysis and tracking columns
     
     Args:
         events_analysis (list): List of analyzed events data
+        account_filter_info (str, optional): Comma-separated account IDs if filtered for specific accounts
         
     Returns:
         BytesIO: Excel file as bytes
@@ -2502,6 +2510,16 @@ def create_excel_report_improved_with_tracking(events_analysis):
         summary_sheet[f'A{row}'] = category.replace('_', ' ').title()
         summary_sheet[f'B{row}'] = count
         row += 1
+    
+    # Add account filter information if provided (for account-specific reports)
+    if account_filter_info:
+        summary_sheet['A10'] = "Filtered Account IDs"
+        summary_sheet['A10'].font = Font(bold=True)
+        
+        # Parse account IDs and add them starting from A11
+        account_ids = [acc.strip() for acc in account_filter_info.split(',')]
+        for i, account_id in enumerate(account_ids, start=11):
+            summary_sheet[f'A{i}'] = account_id
     
     # Add headers to events sheet with tracking columns
     headers = [
@@ -2755,105 +2773,6 @@ def create_excel_report_improved_with_tracking(events_analysis):
     return excel_buffer
 
 
-def send_ses_email_with_attachment_to_recipient(html_content, excel_buffer, total_events, event_categories, events_analysis, recipient_email, accounts_str):
-    """
-    Send email with Excel attachment to a specific recipient
-    
-    Args:
-        html_content (str): HTML content for email body
-        excel_buffer (BytesIO): Excel file as bytes
-        total_events (int): Total number of events
-        event_categories (dict): Event categories count
-        events_analysis (list): List of analyzed events
-        recipient_email (str): Email address to send to
-        accounts_str (str): Comma-separated string of account IDs for subject line and filename
-        
-    Returns:
-        None
-    """
-    try:
-        # Get email configuration from environment variables
-        sender = os.environ['SENDER_EMAIL']
-        recipients = [recipient_email.strip()]
-        
-        # Create email subject with counts and account IDs
-        critical_count = event_categories.get('critical', 0)
-        high_risk_count = sum(1 for event in events_analysis if event.get('risk_level', '').lower() == 'high')
-        
-        if critical_count > 0:
-            subject = f"{customer_name} [CRITICAL] AWS Health Events Analysis - {critical_count} Critical, {high_risk_count} High Risk Events"
-        elif high_risk_count > 0:
-            subject = f"{customer_name} [HIGH RISK] AWS Health Events Analysis - {high_risk_count} High Risk Events"
-        else:
-            subject = f"{customer_name} AWS Health Events Analysis - {total_events} Events"
-        
-        # Generate Excel filename with account IDs (sanitize for filename)
-        current_date = datetime.now().strftime('%Y-%m-%d')
-        current_time = datetime.now().strftime('%H-%M-%S')
-        # Replace commas and spaces with underscores for filename safety
-        accounts_filename = accounts_str.replace(',', '_').replace(' ', '')
-        excel_filename = f"AWS_Health_Events_Analysis_Accounts_{accounts_filename}_{current_date}_{current_time}.xlsx"
-        
-        # Create SES client
-        ses_client = boto3.client('ses')
-        
-        # Create raw email message with attachment
-        msg_raw = {
-            'Source': sender,
-            'Destinations': recipients,
-            'RawMessage': {
-                'Data': create_raw_email_with_attachment(
-                    sender=sender,
-                    recipients=recipients,
-                    subject=subject,
-                    html_body=html_content,
-                    attachment_data=excel_buffer.getvalue(),
-                    attachment_name=excel_filename
-                )
-            }
-        }
-        
-        # Send email
-        response = ses_client.send_raw_email(**msg_raw)
-        print(f"Account-specific email sent successfully to {recipient_email}. Message ID: {response['MessageId']}")
-
-        # Upload to S3 if configured
-        try:
-            # Determine which bucket to use - external or internal
-            bucket_name = S3_BUCKET_NAME if S3_BUCKET_NAME else REPORTS_BUCKET
-            
-            if bucket_name:
-                # Create S3 client
-                s3_client = boto3.client('s3')
-                
-                # Generate S3 key with prefix if provided (only for external bucket)
-                if S3_BUCKET_NAME:
-                    s3_key = f"{S3_KEY_PREFIX.rstrip('/')}/{excel_filename}" if S3_KEY_PREFIX else excel_filename
-                else:
-                    s3_key = excel_filename  # No prefix for internal bucket
-                
-                # Reset buffer position to the beginning
-                excel_buffer.seek(0)
-                
-                # Upload buffer to S3 using put_object
-                s3_client.put_object(
-                    Bucket=bucket_name,
-                    Key=s3_key,
-                    Body=excel_buffer.getvalue(),
-                    ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                )
-                
-                # Generate S3 URL for the uploaded file
-                s3_url = f"s3://{bucket_name}/{s3_key}"
-                print(f"Successfully uploaded account-specific file to {s3_url}")
-                     
-        except Exception as e:
-            print(f"Error uploading account-specific file to S3: {str(e)}")
-        
-    except Exception as e:
-        print(f"Error sending account-specific email: {str(e)}")
-        traceback.print_exc()
-
 
 def send_ses_email_with_attachment(html_content, excel_buffer, total_events, event_categories,events_analysis):
     """
@@ -2890,7 +2809,7 @@ def send_ses_email_with_attachment(html_content, excel_buffer, total_events, eve
         # Generate Excel filename
                 # Generate Excel filename
         current_date = datetime.now().strftime('%Y-%m-%d')
-        current_time = datetime.now().strftime('%H-%M-%S')
+        current_time = datetime.now().strftime('%H-%M')
         excel_filename = EXCEL_FILENAME_TEMPLATE.format(date=current_date, time=current_time)
         
         # Create SES client
