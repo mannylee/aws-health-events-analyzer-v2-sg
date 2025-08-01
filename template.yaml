@@ -77,6 +77,15 @@ Parameters:
     Type: String
     Description: '(Optional) Health events analyser will analyse a file on S3 instead of using the Health API'
     Default: ''
+    
+  # Custom account email mapping table
+  UseCustomAccountEmailMapping:
+    Type: String
+    Description: 'Enable custom account-email mapping using DynamoDB table (true/false). When enabled, creates a DynamoDB table for managing account-to-email mappings.'
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
 
 Resources:
   # Layer for Python dependencies
@@ -138,6 +147,16 @@ Resources:
                   - organizations:ListAccounts
                   - organizations:DescribeAccount
                 Resource: '*'
+              # DynamoDB permissions for custom account-email mapping
+              - !If
+                - EnableCustomMapping
+                - Effect: Allow
+                  Action:
+                    - dynamodb:Scan
+                    - dynamodb:GetItem
+                    - dynamodb:Query
+                  Resource: !GetAtt AccountEmailMappingTable.Arn
+                - !Ref AWS::NoValue
               # S3 permissions for temporary file storage (internal bucket)
               - Effect: Allow
                 Action:
@@ -216,7 +235,7 @@ Resources:
   HealthEventsAnalyzerFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Sub 'aws-health-events-analyzer-${AWS::StackName}'
+      FunctionName: !Sub 'health-events-analyzer-${AWS::StackName}'
       Handler: index.lambda_handler
       Role: !GetAtt HealthEventsAnalyzerRole.Arn
       Runtime: python3.11
@@ -245,6 +264,9 @@ Resources:
           BEDROCK_TOP_P: !Ref BedrockTopP
           # Organization account email mapping
           USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING: !Ref UseOrganizationAccountEmailMapping
+          # Custom account email mapping configuration
+          USE_CUSTOM_ACCOUNT_EMAIL_MAPPING: !Ref UseCustomAccountEmailMapping
+          ACCOUNT_EMAIL_MAPPING_TABLE: !If [EnableCustomMapping, !Ref AccountEmailMappingTable, '']
           # S3 health events override (for testing)
           OVERRIDE_S3_HEALTH_EVENTS_ARN: !Ref OverrideS3HealthEventsArn
 
@@ -270,9 +292,33 @@ Resources:
       Principal: 'events.amazonaws.com'
       SourceArn: !GetAtt HealthEventsAnalyzerScheduleRule.Arn
 
+  # DynamoDB table for custom account-email mapping
+  AccountEmailMappingTable:
+    Type: AWS::DynamoDB::Table
+    Condition: EnableCustomMapping
+    Properties:
+      TableName: !Sub 'health-events-account-email-mapping-${AWS::StackName}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: AccountId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: AccountId
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Purpose
+          Value: AWS Health Events Account Email Mapping
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
 Conditions:
   ScheduleIsEnabled: !Equals [!Ref ScheduleEnabled, 'true']
   HasExternalS3Bucket: !Not [!Equals [!Ref S3BucketName, '']]
+  EnableCustomMapping: !Equals [!Ref UseCustomAccountEmailMapping, 'true']
 
 Outputs:
   HealthEventsAnalyzerFunctionArn:
@@ -298,3 +344,19 @@ Outputs:
   BucketTimestamp:
     Description: 'Timestamp used in bucket name generation'
     Value: !GetAtt TimestampGenerator.Timestamp
+    
+  AccountEmailMappingTableName:
+    Description: 'Name of the DynamoDB table for account-email mapping (if enabled)'
+    Value: !If [EnableCustomMapping, !Ref AccountEmailMappingTable, 'Custom mapping not enabled']
+    
+  AccountEmailMappingTableArn:
+    Description: 'ARN of the DynamoDB table for account-email mapping (if enabled)'
+    Value: !If [EnableCustomMapping, !GetAtt AccountEmailMappingTable.Arn, 'Custom mapping not enabled']
+    
+  UseCustomAccountEmailMappingStatus:
+    Description: 'Status of custom account-email mapping feature'
+    Value: !Ref UseCustomAccountEmailMapping
+    
+  UseOrganizationAccountEmailMappingStatus:
+    Description: 'Status of AWS Organizations account-email mapping feature'
+    Value: !Ref UseOrganizationAccountEmailMapping
