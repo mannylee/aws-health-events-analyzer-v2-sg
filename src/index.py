@@ -27,6 +27,7 @@ S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME', '')
 S3_KEY_PREFIX = os.environ.get('S3_KEY_PREFIX', '')
 REPORTS_BUCKET = os.environ.get('REPORTS_BUCKET', '')
 USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING = os.environ.get('USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING', 'false').lower() == 'true'
+USE_CUSTOM_ACCOUNT_EMAIL_MAPPING = os.environ.get('USE_CUSTOM_ACCOUNT_EMAIL_MAPPING', 'false').lower() == 'true'
 OVERRIDE_S3_HEALTH_EVENTS_ARN = os.environ.get('OVERRIDE_S3_HEALTH_EVENTS_ARN', '')
 
 excluded_services = [s.strip() for s in excluded_services_str.split(',') if s.strip()]
@@ -69,6 +70,93 @@ def should_verify_recipient_email():
         bool: True if verification is required (sandbox mode), False otherwise
     """
     return is_ses_in_sandbox_mode()
+
+
+def get_custom_account_email_mapping_from_dynamodb():
+    """
+    Fetch custom account-email mapping from DynamoDB table
+    
+    Returns:
+        tuple: (account_to_email_mapping, email_to_accounts_mapping)
+            - account_to_email_mapping: dict mapping account IDs to email addresses
+            - email_to_accounts_mapping: dict mapping email addresses to lists of account IDs
+    """
+    # Check if custom mapping is enabled
+    if not USE_CUSTOM_ACCOUNT_EMAIL_MAPPING:
+        print("Custom account email mapping is disabled")
+        return {}, {}
+    
+    table_name = os.environ.get('ACCOUNT_EMAIL_MAPPING_TABLE', '')
+    if not table_name:
+        print("Custom mapping is enabled but no DynamoDB table name configured")
+        return {}, {}
+    
+    try:
+        print(f"Fetching custom account email mapping from DynamoDB table: {table_name}")
+        dynamodb = boto3.resource('dynamodb')
+        table = dynamodb.Table(table_name)
+        
+        # Scan the table to get all mappings
+        response = table.scan()
+        items = response['Items']
+        
+        # Handle pagination if there are many items
+        while 'LastEvaluatedKey' in response:
+            print("Fetching additional items from DynamoDB (pagination)...")
+            response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+            items.extend(response['Items'])
+        
+        print(f"Successfully loaded {len(items)} account mappings from DynamoDB")
+        
+        # Convert to both formats for compatibility with existing code
+        account_to_email = {}
+        email_to_accounts = defaultdict(list)
+        
+        for item in items:
+            account_id = item.get('AccountId', '').strip()
+            email = item.get('Email', '').strip()
+            team_name = item.get('TeamName', '')
+            environment = item.get('Environment', '')
+            
+            if not account_id or not email:
+                print(f"Warning: Skipping invalid mapping - AccountId: '{account_id}', Email: '{email}'")
+                continue
+            
+            account_to_email[account_id] = email
+            email_to_accounts[email].append(account_id)
+            
+            # Log the mapping with additional context
+            context_info = []
+            if team_name:
+                context_info.append(f"Team: {team_name}")
+            if environment:
+                context_info.append(f"Env: {environment}")
+            
+            context_str = f" ({', '.join(context_info)})" if context_info else ""
+            print(f"Custom mapping: {account_id} -> {email}{context_str}")
+        
+        print(f"Created account-to-email mapping for {len(account_to_email)} accounts")
+        print(f"Found {len(email_to_accounts)} unique email addresses")
+        
+        # Log email-to-accounts mapping for verification
+        for email, accounts in email_to_accounts.items():
+            print(f"Email {email} will receive events for accounts: {', '.join(accounts)}")
+        
+        return account_to_email, dict(email_to_accounts)
+        
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        if error_code == 'ResourceNotFoundException':
+            print(f"DynamoDB table {table_name} not found")
+        elif error_code == 'AccessDeniedException':
+            print(f"Access denied when trying to read DynamoDB table {table_name}. Ensure Lambda has dynamodb:Scan permission.")
+        else:
+            print(f"Error accessing DynamoDB table: {error_code} - {e.response['Error']['Message']}")
+        return {}, {}
+    except Exception as e:
+        print(f"Error fetching custom mapping from DynamoDB: {str(e)}")
+        traceback.print_exc()
+        return {}, {}
 
 
 def get_organization_account_email_mapping():
@@ -136,6 +224,103 @@ def get_organization_account_email_mapping():
         traceback.print_exc()
     
     return account_to_email, dict(email_to_accounts)
+
+
+def get_combined_account_email_mapping():
+    """
+    Get account-email mapping using hybrid approach:
+    1. Start with AWS Organizations mapping (if enabled)
+    2. Override with custom DynamoDB mapping (if enabled)
+    3. DynamoDB takes precedence for accounts that exist in both sources
+    
+    Returns:
+        tuple: (account_to_email_mapping, email_to_accounts_mapping)
+            - account_to_email_mapping: dict mapping account IDs to email addresses
+            - email_to_accounts_mapping: dict mapping email addresses to lists of account IDs
+    """
+    print(f"Account email mapping configuration:")
+    print(f"  - Custom DynamoDB mapping: {'ENABLED' if USE_CUSTOM_ACCOUNT_EMAIL_MAPPING else 'DISABLED'}")
+    print(f"  - Organizations mapping: {'ENABLED' if USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING else 'DISABLED'}")
+    
+    # Initialize combined mappings
+    combined_account_to_email = {}
+    combined_email_to_accounts = defaultdict(list)
+    
+    # Step 1: Get Organizations mapping as base (if enabled)
+    if USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING:
+        print("Fetching AWS Organizations mapping as base...")
+        org_account_to_email, org_email_to_accounts = get_organization_account_email_mapping()
+        
+        if org_account_to_email:
+            combined_account_to_email.update(org_account_to_email)
+            for email, accounts in org_email_to_accounts.items():
+                combined_email_to_accounts[email].extend(accounts)
+            print(f"Added {len(org_account_to_email)} accounts from Organizations mapping")
+        else:
+            print("Organizations mapping is enabled but no mappings found")
+    
+    # Step 2: Override with DynamoDB mapping (if enabled)
+    if USE_CUSTOM_ACCOUNT_EMAIL_MAPPING:
+        print("Fetching custom DynamoDB mapping for overrides...")
+        custom_account_to_email, custom_email_to_accounts = get_custom_account_email_mapping_from_dynamodb()
+        
+        if custom_account_to_email:
+            # Track overrides for logging
+            overridden_accounts = []
+            new_accounts = []
+            
+            for account_id, new_email in custom_account_to_email.items():
+                old_email = combined_account_to_email.get(account_id)
+                
+                if old_email and old_email != new_email:
+                    # This account exists in Organizations but with different email
+                    overridden_accounts.append(f"{account_id}: {old_email} -> {new_email}")
+                    # Remove from old email list
+                    if old_email in combined_email_to_accounts:
+                        combined_email_to_accounts[old_email] = [
+                            acc for acc in combined_email_to_accounts[old_email] if acc != account_id
+                        ]
+                        # Clean up empty email lists
+                        if not combined_email_to_accounts[old_email]:
+                            del combined_email_to_accounts[old_email]
+                elif not old_email:
+                    # This is a new account not in Organizations
+                    new_accounts.append(f"{account_id} -> {new_email}")
+                
+                # Apply the DynamoDB mapping
+                combined_account_to_email[account_id] = new_email
+                if account_id not in combined_email_to_accounts[new_email]:
+                    combined_email_to_accounts[new_email].append(account_id)
+            
+            print(f"Added {len(custom_account_to_email)} accounts from DynamoDB mapping")
+            
+            if overridden_accounts:
+                print(f"DynamoDB overrode {len(overridden_accounts)} Organizations mappings:")
+                for override in overridden_accounts:
+                    print(f"  Override: {override}")
+            
+            if new_accounts:
+                print(f"DynamoDB added {len(new_accounts)} new accounts not in Organizations:")
+                for new_account in new_accounts:
+                    print(f"  New: {new_account}")
+        else:
+            print("Custom DynamoDB mapping is enabled but no mappings found")
+    
+    # Convert defaultdict back to regular dict
+    combined_email_to_accounts = dict(combined_email_to_accounts)
+    
+    # Summary logging
+    if combined_account_to_email:
+        print(f"Final combined mapping: {len(combined_account_to_email)} accounts across {len(combined_email_to_accounts)} email addresses")
+        
+        # Log final email-to-accounts mapping for verification
+        for email, accounts in combined_email_to_accounts.items():
+            print(f"Email {email} will receive events for accounts: {', '.join(accounts)}")
+        
+        return combined_account_to_email, combined_email_to_accounts
+    else:
+        print("No account-email mapping configured - all events will go to default recipients")
+        return {}, {}
 
 
 def expand_events_by_account(events):
@@ -2003,8 +2188,8 @@ def send_account_specific_emails(events_analysis, items_count, event_categories,
         None
     """
     try:
-        # Get account email mapping from AWS Organizations - returns both mappings
-        account_to_email, email_to_accounts = get_organization_account_email_mapping()
+        # Get account email mapping using hierarchical approach (Parameter Store -> Organizations -> None)
+        account_to_email, email_to_accounts = get_combined_account_email_mapping()
         
         # Initialize tracking for email sending results
         email_sending_results = {}  # email -> (success, error_message)
@@ -2462,6 +2647,105 @@ def send_ses_email_with_attachment_master(html_content, excel_buffer, total_even
         traceback.print_exc()
 
 
+def get_account_mapping_with_sources(include_availability_status=False):
+    """
+    Get account-email mapping with detailed source tracking for each account.
+    
+    Args:
+        include_availability_status (bool): Whether to include availability status when both sources are enabled
+    
+    Returns:
+        list: List of dictionaries with keys: account_id, email, source, availability_status (optional)
+    """
+    mapping_data = []
+    
+    try:
+        # Get Organizations mapping first
+        org_account_to_email = {}
+        if USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING:
+            org_account_to_email, _ = get_organization_account_email_mapping()
+        
+        # Get DynamoDB mapping
+        custom_account_to_email = {}
+        if USE_CUSTOM_ACCOUNT_EMAIL_MAPPING:
+            custom_account_to_email, _ = get_custom_account_email_mapping_from_dynamodb()
+        
+        # Combine all accounts from both sources
+        all_accounts = set()
+        if org_account_to_email:
+            all_accounts.update(org_account_to_email.keys())
+        if custom_account_to_email:
+            all_accounts.update(custom_account_to_email.keys())
+        
+        # Determine source and email for each account
+        for account_id in all_accounts:
+            email = None
+            source = None
+            availability_status = None
+            
+            # Check if account exists in DynamoDB (highest priority)
+            if account_id in custom_account_to_email:
+                email = custom_account_to_email[account_id]
+                source = "Custom DynamoDB"
+            # Fallback to Organizations mapping
+            elif account_id in org_account_to_email:
+                email = org_account_to_email[account_id]
+                source = "AWS Organizations"
+            
+            # Determine availability status when both sources are enabled and requested
+            if include_availability_status and USE_CUSTOM_ACCOUNT_EMAIL_MAPPING and USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING:
+                in_dynamodb = account_id in custom_account_to_email
+                in_organizations = account_id in org_account_to_email
+                
+                if in_dynamodb and not in_organizations:
+                    availability_status = "DynamoDB only"
+                elif in_organizations and not in_dynamodb:
+                    availability_status = "Organizations only"
+                elif in_dynamodb and in_organizations:
+                    availability_status = "Both sources"
+                else:
+                    availability_status = "Unknown"  # Should not happen
+            
+            if email and source:
+                item = {
+                    'account_id': account_id,
+                    'email': email,
+                    'source': source
+                }
+                
+                if include_availability_status:
+                    item['availability_status'] = availability_status
+                
+                mapping_data.append(item)
+        
+        print(f"Generated mapping data with sources for {len(mapping_data)} accounts")
+        
+        # Log source breakdown
+        source_counts = {}
+        for item in mapping_data:
+            source_counts[item['source']] = source_counts.get(item['source'], 0) + 1
+        
+        for source, count in source_counts.items():
+            print(f"  {source}: {count} accounts")
+        
+        # Log availability status breakdown if included
+        if include_availability_status and USE_CUSTOM_ACCOUNT_EMAIL_MAPPING and USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING:
+            status_counts = {}
+            for item in mapping_data:
+                status = item.get('availability_status', 'Unknown')
+                status_counts[status] = status_counts.get(status, 0) + 1
+            
+            print("  Availability status breakdown:")
+            for status, count in status_counts.items():
+                print(f"    {status}: {count} accounts")
+        
+    except Exception as e:
+        print(f"Error generating mapping data with sources: {str(e)}")
+        traceback.print_exc()
+    
+    return mapping_data
+
+
 def create_excel_report_improved_with_tracking(events_analysis, account_filter_info=None, include_tracking_columns=True):
     """
     Create an improved Excel report with detailed event analysis and optional tracking columns
@@ -2518,15 +2802,32 @@ def create_excel_report_improved_with_tracking(events_analysis, account_filter_i
         summary_sheet[f'B{row}'] = count
         row += 1
     
-    # Add account filter information if provided (for account-specific reports)
-    if account_filter_info:
-        summary_sheet['A10'] = "Filtered Account IDs"
-        summary_sheet['A10'].font = Font(bold=True)
-        
-        # Parse account IDs and add them starting from A11
-        account_ids = [acc.strip() for acc in account_filter_info.split(',')]
-        for i, account_id in enumerate(account_ids, start=11):
-            summary_sheet[f'A{i}'] = account_id
+    # Removed: Filtered Account IDs section - now using Account Email Mapping sheet instead
+    
+    # Add configuration summary for master reports only (when tracking columns are included)
+    if include_tracking_columns:
+        try:
+            summary_sheet['A9'] = "Configuration Summary:"
+            summary_sheet['A9'].font = Font(bold=True)
+            
+            config_row = 10
+            summary_sheet[f'A{config_row}'] = f"Custom DynamoDB Mapping: {'ENABLED' if USE_CUSTOM_ACCOUNT_EMAIL_MAPPING else 'DISABLED'}"
+            config_row += 1
+            summary_sheet[f'A{config_row}'] = f"AWS Organizations Mapping: {'ENABLED' if USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING else 'DISABLED'}"
+            config_row += 1
+            
+            if USE_CUSTOM_ACCOUNT_EMAIL_MAPPING:
+                table_name = os.environ.get('ACCOUNT_EMAIL_MAPPING_TABLE', 'Not configured')
+                summary_sheet[f'A{config_row}'] = f"DynamoDB Table: {table_name}"
+                config_row += 1
+            
+            # Add default recipients info
+            default_recipients = os.environ.get('RECIPIENT_EMAILS', 'Not configured')
+            summary_sheet[f'A{config_row}'] = f"Default Recipients: {default_recipients}"
+            
+        except Exception as e:
+            print(f"Error adding configuration summary to Summary sheet: {str(e)}")
+            summary_sheet['A9'] = f"Configuration Summary: Error - {str(e)}"
     
     # Add headers to events sheet with optional tracking columns
     headers = [
@@ -2790,6 +3091,96 @@ def create_excel_report_improved_with_tracking(events_analysis, account_filter_i
     analysis_sheet.column_dimensions['B'].width = 15
     analysis_sheet.column_dimensions['C'].width = 15
     analysis_sheet.column_dimensions['D'].width = 100
+    
+    # Add account-email mapping configuration sheet for transparency (all reports)
+    # This provides visibility into account-email routing for both master and account-specific reports
+    mapping_sheet = wb.create_sheet(title="Account Email Mapping")
+    
+    # Determine if we should include availability status column (master reports only with both sources enabled)
+    include_availability_column = (include_tracking_columns and 
+                                 USE_CUSTOM_ACCOUNT_EMAIL_MAPPING and 
+                                 USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING)
+    
+    # Add headers for mapping sheet
+    mapping_sheet['A1'] = "Account ID"
+    mapping_sheet['B1'] = "Email Address"
+    mapping_sheet['C1'] = "Mapping Source"
+    
+    # Add availability status column header if needed
+    header_cols = ['A1', 'B1', 'C1']
+    if include_availability_column:
+        mapping_sheet['D1'] = "Availability Status"
+        header_cols.append('D1')
+    
+    # Style headers
+    for col in header_cols:
+        mapping_sheet[col].font = Font(bold=True)
+        mapping_sheet[col].fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        mapping_sheet[col].font = Font(bold=True, color="FFFFFF")
+    
+    # Get current account mapping configuration with source tracking
+    try:
+        account_to_email, email_to_accounts = get_combined_account_email_mapping()
+        
+        # Get detailed mapping with source information (include availability status for master reports with both sources)
+        mapping_data = get_account_mapping_with_sources(include_availability_status=include_availability_column)
+        
+        # Add mapping data to sheet
+        row = 2
+        if mapping_data:
+            # Filter mappings for account-specific reports
+            if account_filter_info and not include_tracking_columns:
+                # For account-specific reports, only show mappings for accounts in this report
+                filtered_account_ids = set(acc.strip() for acc in account_filter_info.split(','))
+                mapping_data = [item for item in mapping_data if item['account_id'] in filtered_account_ids]
+            
+            # Sort by email address for master reports, by account ID for account-specific reports
+            if include_tracking_columns:
+                # Master report: sort by email address, then by account ID
+                mapping_data.sort(key=lambda x: (x['email'], x['account_id']))
+            else:
+                # Account-specific report: sort by account ID
+                mapping_data.sort(key=lambda x: x['account_id'])
+            
+            # Add data to sheet
+            for item in mapping_data:
+                mapping_sheet[f'A{row}'] = item['account_id']
+                mapping_sheet[f'B{row}'] = item['email']
+                mapping_sheet[f'C{row}'] = item['source']
+                
+                # Add availability status column if included
+                if include_availability_column:
+                    mapping_sheet[f'D{row}'] = item.get('availability_status', 'Unknown')
+                
+                row += 1
+        else:
+            # No mappings configured
+            mapping_sheet['A2'] = "No account-email mappings configured"
+            mapping_sheet['B2'] = "All events sent to default recipients"
+            mapping_sheet['C2'] = "Default configuration"
+            
+            # Merge cells appropriately based on number of columns
+            if include_availability_column:
+                mapping_sheet.merge_cells('A2:D2')
+            else:
+                mapping_sheet.merge_cells('A2:C2')
+            row = 3
+        
+    except Exception as e:
+        print(f"Error adding mapping sheet: {str(e)}")
+        # Add error information to sheet
+        mapping_sheet['A2'] = "Error retrieving mapping configuration"
+        mapping_sheet['B2'] = str(e)
+        mapping_sheet['C2'] = "Error"
+    
+    # Set column widths for mapping sheet
+    mapping_sheet.column_dimensions['A'].width = 20
+    mapping_sheet.column_dimensions['B'].width = 40
+    mapping_sheet.column_dimensions['C'].width = 25
+    
+    # Set width for availability status column if included
+    if include_availability_column:
+        mapping_sheet.column_dimensions['D'].width = 20
     
     # Save to BytesIO
     excel_buffer = BytesIO()
