@@ -11,6 +11,8 @@ A serverless solution that analyzes AWS Health events using Amazon Bedrock, cate
 - Generates detailed Excel reports with event analysis
 - Sends email notifications with reports attached
 - **Account-specific email routing** - Route events to different teams based on AWS account
+- **Hybrid mapping system** - Combines AWS Organizations and custom DynamoDB mappings with intelligent precedence
+- **Enhanced Excel reports** - Account Email Mapping sheet provides transparency into routing configuration
 - **S3 health events override** - Process pre-exported health events from S3 for testing/compliance
 - **Email verification checks** - Ensures emails are only sent to verified SES recipients
 - Runs automatically on a weekly schedule (every Tuesday at 5 PM UTC)
@@ -110,13 +112,163 @@ The solution supports routing health events to different email addresses based o
 
 #### Prerequisites
 
-- AWS Organizations must be enabled
+- AWS Organizations must be enabled (for Organizations-based mapping)
 - The Lambda execution role must have `organizations:ListAccounts` and `organizations:DescribeAccount` permissions (already included in the template)
 - Account email addresses in AWS Organizations should be verified in SES if running in sandbox mode
+- For custom mapping: SSM Parameter Store access (already included in the template)
 
-#### Configuration
+#### Configuration Options
 
+**Option 1: AWS Organizations Mapping (Automatic)**
 Enable account-specific email routing by setting the `UseOrganizationAccountEmailMapping` parameter to `true`. The solution will automatically fetch account email addresses from AWS Organizations.
+
+**Option 2: Custom DynamoDB Mapping (Manual)**
+For more control over account-to-email mappings, you can use a DynamoDB table for flexible and scalable mapping management:
+
+1. Set the `UseCustomAccountEmailMapping` parameter to `true` during deployment
+2. The solution will create a DynamoDB table for managing account-email mappings
+3. Add mappings to the table using AWS CLI, Console, or API
+
+**Option 3: Hybrid Approach**
+You can use both options together. The solution uses this priority order:
+1. **AWS Organizations mapping** (base layer)
+2. **Custom DynamoDB mapping** (overrides Organizations mapping)
+3. **Default email recipients** (final fallback)
+
+When both mapping options are enabled, DynamoDB mappings take precedence for accounts that exist in both sources, while Organizations provides the base mapping for all other accounts.
+
+#### Managing DynamoDB Mappings
+
+**Deploy with custom mapping enabled:**
+```bash
+sam deploy --parameter-overrides \
+  UseCustomAccountEmailMapping=true
+```
+
+**Add account mappings:**
+```bash
+# Add a single account mapping
+aws dynamodb put-item \
+  --table-name health-events-account-email-mapping-{stack-name} \
+  --item '{
+    "AccountId": {"S": "123456789012"},
+    "Email": {"S": "dev-team@company.com"},
+    "TeamName": {"S": "Development Team"},
+    "Environment": {"S": "dev"},
+    "CreatedAt": {"S": "2024-01-08T10:00:00Z"},
+    "UpdatedAt": {"S": "2024-01-08T10:00:00Z"}
+  }'
+
+# Add multiple accounts for the same email (one team managing multiple accounts)
+aws dynamodb put-item \
+  --table-name health-events-account-email-mapping-{stack-name} \
+  --item '{
+    "AccountId": {"S": "234567890123"},
+    "Email": {"S": "dev-team@company.com"},
+    "TeamName": {"S": "Development Team"},
+    "Environment": {"S": "staging"},
+    "CreatedAt": {"S": "2024-01-08T10:00:00Z"},
+    "UpdatedAt": {"S": "2024-01-08T10:00:00Z"}
+  }'
+```
+
+**Update an existing mapping:**
+```bash
+aws dynamodb update-item \
+  --table-name health-events-account-email-mapping-{stack-name} \
+  --key '{"AccountId": {"S": "123456789012"}}' \
+  --update-expression "SET Email = :email, UpdatedAt = :updated" \
+  --expression-attribute-values '{
+    ":email": {"S": "new-dev-team@company.com"},
+    ":updated": {"S": "2024-01-08T16:00:00Z"}
+  }'
+```
+
+**Query all accounts for a specific email:**
+```bash
+aws dynamodb scan \
+  --table-name health-events-account-email-mapping-{stack-name} \
+  --filter-expression "Email = :email" \
+  --expression-attribute-values '{":email": {"S": "dev-team@company.com"}}'
+```
+
+#### DynamoDB Table Structure
+
+The table uses the following structure:
+- **AccountId** (String, Partition Key): AWS Account ID
+- **Email** (String): Email address to receive notifications
+- **TeamName** (String, Optional): Team or group name
+- **Environment** (String, Optional): Environment identifier (dev/staging/prod)
+- **CreatedAt** (String): ISO timestamp when mapping was created
+- **UpdatedAt** (String): ISO timestamp when mapping was last updated
+
+#### Helper Script for DynamoDB Management
+
+A Python helper script is provided for easier management of account mappings:
+
+```bash
+# List all current mappings
+python3 scripts/manage-account-mappings.py \
+  --table-name health-events-account-email-mapping-{stack-name} \
+  --action list
+
+# Add a single mapping
+python3 scripts/manage-account-mappings.py \
+  --table-name health-events-account-email-mapping-{stack-name} \
+  --action add \
+  --account 123456789012 \
+  --email dev-team@company.com \
+  --team "Development Team" \
+  --env dev
+
+# Bulk import from JSON file
+python3 scripts/manage-account-mappings.py \
+  --table-name health-events-account-email-mapping-{stack-name} \
+  --action bulk-import \
+  --file scripts/example-mappings.json
+```
+
+The helper script supports:
+- **check-config**: Display current stack configuration and mapping status
+- **list**: Display all current mappings grouped by email
+- **add**: Add a new account mapping
+- **update**: Update an existing mapping
+- **delete**: Remove an account mapping
+- **bulk-import**: Import multiple mappings from a JSON file
+
+See `scripts/example-mappings.json` for the expected JSON format for bulk imports.
+
+#### Checking Your Configuration
+
+After deployment, you can check your configuration in several ways:
+
+**Using CloudFormation CLI:**
+```bash
+# Check all mapping-related configuration
+aws cloudformation describe-stacks \
+  --stack-name your-stack-name \
+  --query 'Stacks[0].Outputs[?contains(OutputKey, `Mapping`)].[OutputKey,OutputValue]' \
+  --output table
+
+# Check specific parameter
+aws cloudformation describe-stacks \
+  --stack-name your-stack-name \
+  --query 'Stacks[0].Outputs[?OutputKey==`UseCustomAccountEmailMappingStatus`].OutputValue' \
+  --output text
+```
+
+**Using the helper script:**
+```bash
+python3 scripts/manage-account-mappings.py \
+  --stack-name your-stack-name \
+  --action check-config
+```
+
+This will show you:
+- Whether custom DynamoDB mapping is enabled
+- Whether Organizations mapping is enabled  
+- The DynamoDB table name (if created)
+- Warnings if no mapping is configured
 
 #### How It Works
 
@@ -125,6 +277,43 @@ Enable account-specific email routing by setting the `UseOrganizationAccountEmai
 3. **Email Verification**: The solution verifies that recipient emails are verified in SES before sending
 4. **Fallback Handling**: If an account-specific email fails to send, those events are included in the master email
 5. **Email Status Tracking**: The master spreadsheet includes tracking columns ("Mapped Email" and "Email Status") that show which email address each event was mapped to and whether the email was sent successfully, failed due to SES verification issues, or sent to the default recipients
+
+#### Excel Report Structure
+
+The solution generates different Excel reports for different audiences:
+
+**Master Reports** (sent to default recipients):
+- **Summary Sheet**: Includes configuration summary showing mapping settings, DynamoDB table name, and default recipients
+- **All Events & Critical Events Sheets**: Include tracking columns showing "Mapped Email" and "Email Status" for each event
+- **Account Email Mapping Sheet**: Shows all account-to-email mappings with source information, sorted by email address
+- **Risk Analysis Sheet**: Complete risk analysis for all events
+- **Enhanced Visibility**: When both DynamoDB and Organizations mapping are enabled, includes an "Availability Status" column showing whether accounts exist in "DynamoDB only", "Organizations only", or "Both sources"
+
+**Account-Specific Reports** (sent to mapped email addresses):
+- **Summary Sheet**: Clean summary without configuration details
+- **All Events & Critical Events Sheets**: No tracking columns (focused on relevant events only)
+- **Account Email Mapping Sheet**: Shows only mappings relevant to the recipient's accounts, sorted by account ID
+- **Risk Analysis Sheet**: Risk analysis for relevant events only
+
+#### Account Email Mapping Sheet Details
+
+Every Excel report includes an "Account Email Mapping" sheet that provides transparency into how accounts are routed to email addresses:
+
+**Standard Columns:**
+- **Account ID**: AWS Account ID
+- **Email Address**: Email address that receives events for this account
+- **Mapping Source**: Shows "Custom DynamoDB" or "AWS Organizations"
+
+**Enhanced Visibility (Master Reports Only):**
+When both `UseCustomAccountEmailMapping=true` and `UseOrganizationAccountEmailMapping=true` are enabled, master reports include an additional column:
+- **Availability Status**: Shows account availability across sources:
+  - "DynamoDB only": Account exists in DynamoDB but not in Organizations
+  - "Organizations only": Account exists in Organizations but not in DynamoDB  
+  - "Both sources": Account exists in both sources (DynamoDB takes precedence)
+
+**Sorting and Filtering:**
+- **Master reports**: Sorted by email address, then by account ID
+- **Account-specific reports**: Shows only relevant accounts, sorted by account ID
 
 #### Example Configuration
 
@@ -142,6 +331,9 @@ sam deploy --parameter-overrides \
 - **Audit Trail**: Master email provides complete visibility for administrators with detailed tracking of email delivery status
 - **Email Status Visibility**: The master spreadsheet shows exactly which emails were sent successfully, which failed due to SES verification, and which events were routed to default recipients
 - **Automatic Discovery**: Account email addresses are automatically retrieved from AWS Organizations
+- **Mapping Transparency**: All reports include an Account Email Mapping sheet showing how accounts are routed to email addresses
+- **Source Tracking**: Each mapping shows whether it comes from "Custom DynamoDB" or "AWS Organizations"
+- **Hybrid Management**: When both mapping sources are enabled, administrators can see which accounts exist in both sources vs. only one source
 
 ### S3 Health Events Override
 
@@ -259,6 +451,7 @@ parameter_overrides = "SenderEmail=\"customer2@example.com\" RecipientEmails=\"r
 | S3BucketName | Name of external S3 bucket for report storage (optional) | '' |
 | S3KeyPrefix | Prefix for objects in the external S3 bucket (optional) | '' |
 | UseOrganizationAccountEmailMapping | Enable account-specific email routing using AWS Organizations (true/false) | 'false' |
+| UseCustomAccountEmailMapping | Enable custom account-email mapping using DynamoDB table (true/false) | 'false' |
 | OverrideS3HealthEventsArn | S3 object ARN for using pre-exported health events instead of API (optional) | '' |
 
 ## Bedrock Configuration
@@ -281,6 +474,10 @@ The solution consists of:
 5. IAM roles with least-privilege permissions
 6. Integration with Amazon Bedrock for AI analysis
 7. Amazon SES for email delivery
+8. **Hybrid account-email mapping system**:
+   - AWS Organizations integration for automatic account discovery
+   - Optional DynamoDB table for custom account-email mappings
+   - Intelligent routing with DynamoDB overrides taking precedence
 
 ## AWS Resources Created
 
@@ -306,12 +503,15 @@ The solution consists of:
 ### Custom Resource
 - **TimestampGenerator** - CloudFormation custom resource for generating unique S3 bucket names
 
+### DynamoDB Table (Optional)
+- **AccountEmailMappingTable** - Table for storing custom account-to-email mappings (created when UseCustomAccountEmailMapping=true)
+
 ## Testing
 
 After deployment, you can manually invoke the Lambda function:
 
 ```bash
-aws lambda invoke --function-name aws-health-events-analyzer-{stack-name} response.json
+aws lambda invoke --function-name health-events-analyzer-{stack-name} response.json
 ```
 
 Replace `{stack-name}` with your actual stack name.
@@ -347,10 +547,14 @@ The solution publishes the following CloudWatch metrics:
   - For cross-account buckets, verify bucket policies allow access
   - **Tip**: Leave S3BucketName empty to use the internal bucket with automatic permissions
 - **Account-specific email issues**:
-  - Ensure AWS Organizations is enabled and the Lambda has organizations:ListAccounts permissions
-  - Verify that account email addresses in AWS Organizations are verified in SES (if in sandbox mode)
-  - Check CloudWatch Logs for "Access denied when trying to access AWS Organizations" messages
+  - Ensure AWS Organizations is enabled and the Lambda has organizations:ListAccounts permissions (for Organizations mapping)
+  - For DynamoDB mapping: Verify the table exists and Lambda has dynamodb:Scan permissions
+  - Verify that account email addresses are verified in SES (if in sandbox mode)
+  - Check CloudWatch Logs for "Access denied when trying to access AWS Organizations" or "DynamoDB table not found" messages
+  - Use the helper script to verify your DynamoDB mappings: `python3 scripts/manage-account-mappings.py --table-name {table-name} --action list`
   - Failed account-specific emails will fall back to the master email recipients
+  - **Hybrid mapping**: When both sources are enabled, check the "Account Email Mapping" sheet in master reports to verify which source is being used for each account
+  - **Source conflicts**: DynamoDB mappings override Organizations mappings for the same account - use the "Availability Status" column to identify accounts that exist in both sources
 - **S3 Health Events Override issues**:
   - Verify the S3 object ARN is correct and the object exists
   - Ensure the Lambda function has read permissions to the S3 object
