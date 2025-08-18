@@ -435,6 +435,17 @@ parameter_overrides = "SenderEmail=\"customer2@example.com\" RecipientEmails=\"r
 
 **Note:** The `s3_bucket` and `s3_prefix` parameters in the samconfig.toml refer to the SAM deployment bucket, not the bucket where reports are stored. The internal report storage bucket is automatically created with a unique name for each installation, and the external bucket is specified by the `S3BucketName` parameter.
 
+## AWS Health Event Categories
+
+The AWS Health API provides several event type categories that you can use to filter events. Use the `EventCategories` parameter to specify which categories to include in your analysis.
+
+| Category | Description | Example Events |
+|----------|-------------|----------------|
+| **issue** | Service issues and outages affecting AWS services | Service disruptions, API throttling, connectivity issues |
+| **accountNotification** | Important notifications about your AWS account | Billing notifications, security alerts, service limit warnings |
+| **scheduledChange** | Planned maintenance and changes to AWS services | Scheduled maintenance windows, service updates, infrastructure changes |
+| **investigation** | AWS investigations into potential issues | Performance investigations, security investigations |
+
 ## Configuration Parameters
 
 | Parameter | Description | Default |
@@ -442,7 +453,7 @@ parameter_overrides = "SenderEmail=\"customer2@example.com\" RecipientEmails=\"r
 | SenderEmail | Email address to send reports from (must be verified in SES) | - |
 | RecipientEmails | Comma-separated list of email recipients | - |
 | AnalysisWindowDays | Number of days of historical events to analyze | 8 |
-| EventCategories | Optional comma-separated list of event categories to filter | accountNotification |
+| EventCategories | Optional comma-separated list of event categories to filter (see Event Categories section) | accountNotification |
 | ExcludedServices | Optional comma-separated list of services to exclude | - |
 | ExcelFilenameTemplate | Template for Excel filenames | AWS_Health_Events_Analysis_{date}_{time}.xlsx |
 | ScheduleEnabled | Enable or disable the scheduled execution | true |
