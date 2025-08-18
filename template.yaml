@@ -314,6 +314,8 @@ Resources:
           Value: AWS Health Events Account Email Mapping
         - Key: StackName
           Value: !Ref AWS::StackName
+        - Key: auto-delete
+          Value: "no"
 
 Conditions:
   ScheduleIsEnabled: !Equals [!Ref ScheduleEnabled, 'true']
