@@ -11,6 +11,7 @@ A serverless solution that analyzes AWS Health events using Amazon Bedrock, cate
 - Generates detailed Excel reports with event analysis
 - Sends email notifications with reports attached
 - **Account-specific email routing** - Route events to different teams based on AWS account
+- **CC email support** - Optional CC recipients for account-specific emails
 - **Hybrid mapping system** - Combines AWS Organizations and custom DynamoDB mappings with intelligent precedence
 - **Enhanced Excel reports** - Account Email Mapping sheet provides transparency into routing configuration
 - **S3 health events override** - Process pre-exported health events from S3 for testing/compliance
@@ -69,6 +70,7 @@ sam deploy --stack-name health-events-analyzer-v2 \
   --parameter-overrides \
     SenderEmail=your-email@example.com \
     RecipientEmails=recipient1@example.com,recipient2@example.com \
+    RecipientCcEmails=cc1@example.com,cc2@example.com \
     S3BucketName=your-existing-bucket \
     S3KeyPrefix=health-events
 ```
@@ -273,10 +275,11 @@ This will show you:
 #### How It Works
 
 1. **Individual Account Emails**: Events are grouped by account and sent to the specified email addresses
-2. **Master Email**: A comprehensive report with all events is still sent to the default recipients specified in `RecipientEmails`
-3. **Email Verification**: The solution verifies that recipient emails are verified in SES before sending
-4. **Fallback Handling**: If an account-specific email fails to send, those events are included in the master email
-5. **Email Status Tracking**: The master spreadsheet includes tracking columns ("Mapped Email" and "Email Status") that show which email address each event was mapped to and whether the email was sent successfully, failed due to SES verification issues, or sent to the default recipients
+2. **CC Email Support**: Account-specific emails can include CC recipients specified in the `RecipientCcEmails` parameter
+3. **Master Email**: A comprehensive report with all events is still sent to the default recipients specified in `RecipientEmails`
+4. **Email Verification**: The solution verifies that recipient emails are verified in SES before sending
+5. **Fallback Handling**: If an account-specific email fails to send, those events are included in the master email
+6. **Email Status Tracking**: The master spreadsheet includes tracking columns ("Mapped Email" and "Email Status") that show which email address each event was mapped to and whether the email was sent successfully, failed due to SES verification issues, or sent to the default recipients
 
 #### Excel Report Structure
 
@@ -321,6 +324,7 @@ When both `UseCustomAccountEmailMapping=true` and `UseOrganizationAccountEmailMa
 sam deploy --parameter-overrides \
   SenderEmail=notifications@company.com \
   RecipientEmails=admin@company.com,security@company.com \
+  RecipientCcEmails=manager@company.com \
   UseOrganizationAccountEmailMapping=true
 ```
 
@@ -382,6 +386,7 @@ The S3 file should contain health events in the same JSON format returned by the
 sam deploy --parameter-overrides \
   SenderEmail=notifications@company.com \
   RecipientEmails=admin@company.com \
+  RecipientCcEmails=manager@company.com \
   OverrideS3HealthEventsArn="arn:aws:s3:::my-health-data/exports/health-events-2024-01.json"
 ```
 
@@ -415,7 +420,7 @@ s3_prefix = "health-events-analyzer-customer1"
 region = "ap-southeast-1"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
-parameter_overrides = "SenderEmail=\"customer1@example.com\" RecipientEmails=\"recipient1@example.com\" S3BucketName=\"customer1-bucket\" S3KeyPrefix=\"health-reports\""
+parameter_overrides = "SenderEmail=\"customer1@example.com\" RecipientEmails=\"recipient1@example.com\" RecipientCcEmails=\"cc1@example.com\" S3BucketName=\"customer1-bucket\" S3KeyPrefix=\"health-reports\""
 ```
 
 ```toml
@@ -430,7 +435,7 @@ s3_prefix = "health-events-analyzer-customer2"
 region = "ap-southeast-1"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
-parameter_overrides = "SenderEmail=\"customer2@example.com\" RecipientEmails=\"recipient2@example.com\" S3BucketName=\"customer2-bucket\" S3KeyPrefix=\"health-reports\""
+parameter_overrides = "SenderEmail=\"customer2@example.com\" RecipientEmails=\"recipient2@example.com\" RecipientCcEmails=\"cc2@example.com\" S3BucketName=\"customer2-bucket\" S3KeyPrefix=\"health-reports\""
 ```
 
 **Note:** The `s3_bucket` and `s3_prefix` parameters in the samconfig.toml refer to the SAM deployment bucket, not the bucket where reports are stored. The internal report storage bucket is automatically created with a unique name for each installation, and the external bucket is specified by the `S3BucketName` parameter.
@@ -452,6 +457,7 @@ The AWS Health API provides several event type categories that you can use to fi
 |-----------|-------------|---------|
 | SenderEmail | Email address to send reports from (must be verified in SES) | - |
 | RecipientEmails | Comma-separated list of email recipients | - |
+| RecipientCcEmails | Comma-separated list of email addresses to CC on account-specific emails only (optional) | '' |
 | AnalysisWindowDays | Number of days of historical events to analyze | 8 |
 | EventCategories | Optional comma-separated list of event categories to filter (see Event Categories section) | accountNotification |
 | ExcludedServices | Optional comma-separated list of services to exclude | - |
