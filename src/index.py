@@ -21,16 +21,36 @@ BEDROCK_TEMPERATURE = float(os.environ.get('BEDROCK_TEMPERATURE', '0.1'))
 BEDROCK_TOP_P = float(os.environ.get('BEDROCK_TOP_P', '0.9'))
 BEDROCK_MAX_TOKENS = int(os.environ.get('BEDROCK_MAX_TOKENS', '4000'))
 EXCEL_FILENAME_TEMPLATE = os.environ.get('EXCEL_FILENAME_TEMPLATE', 'AWS_Health_Events_Analysis_{date}_{time}.xlsx')
-customer_name = os.environ.get('CUSTOMER_NAME', 'Notification')
-excluded_services_str = os.environ.get('EXCLUDED_SERVICES', '')
+CUSTOMER_NAME = os.environ.get('CUSTOMER_NAME', 'Notification')
+EXCLUDED_SERVICES = os.environ.get('EXCLUDED_SERVICES', '')
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME', '')
 S3_KEY_PREFIX = os.environ.get('S3_KEY_PREFIX', '')
 REPORTS_BUCKET = os.environ.get('REPORTS_BUCKET', '')
 USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING = os.environ.get('USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING', 'false').lower() == 'true'
 USE_CUSTOM_ACCOUNT_EMAIL_MAPPING = os.environ.get('USE_CUSTOM_ACCOUNT_EMAIL_MAPPING', 'false').lower() == 'true'
 OVERRIDE_S3_HEALTH_EVENTS_ARN = os.environ.get('OVERRIDE_S3_HEALTH_EVENTS_ARN', '')
+RECIPIENT_CC_EMAILS = os.environ.get('RECIPIENT_CC_EMAILS', '')
+ANALYSIS_WINDOW_DAYS = int(os.environ.get('ANALYSIS_WINDOW_DAYS', '8'))
+EVENT_CATEGORIES = os.environ.get('EVENT_CATEGORIES', '')
+SENDER_EMAIL = os.environ.get('SENDER_EMAIL', '')
+RECIPIENT_EMAILS = os.environ.get('RECIPIENT_EMAILS', '')
+ACCOUNT_EMAIL_MAPPING_TABLE = os.environ.get('ACCOUNT_EMAIL_MAPPING_TABLE', '')
 
-excluded_services = [s.strip() for s in excluded_services_str.split(',') if s.strip()]
+excluded_services = [s.strip() for s in EXCLUDED_SERVICES.split(',') if s.strip()]
+
+
+def get_cc_recipients():
+    """
+    Get CC recipients from environment variable
+    
+    Returns:
+        list: List of CC email addresses, empty list if none configured
+    """
+    if not RECIPIENT_CC_EMAILS:
+        return []
+    
+    cc_emails = [email.strip() for email in RECIPIENT_CC_EMAILS.split(',') if email.strip()]
+    return cc_emails
 
 
 def is_ses_in_sandbox_mode():
@@ -756,26 +776,22 @@ def lambda_handler(event, context):
     
     try:
         # Get all configuration from environment variables
-        analysis_window_days = int(os.environ['ANALYSIS_WINDOW_DAYS'])
         
         # Get event categories to process from environment variable
         event_categories_to_process = []
-        if 'EVENT_CATEGORIES' in os.environ and os.environ['EVENT_CATEGORIES'].strip():
-            event_categories_to_process = [cat.strip() for cat in os.environ['EVENT_CATEGORIES'].split(',')]
+        if EVENT_CATEGORIES.strip():
+            event_categories_to_process = [cat.strip() for cat in EVENT_CATEGORIES.split(',')]
             print(f"Will only process these event categories: {event_categories_to_process}")
         else:
             print("No EVENT_CATEGORIES specified, will process all event categories")
 
-        excluded_services_str = os.environ.get('EXCLUDED_SERVICES', '')
-        excluded_services = [s.strip() for s in excluded_services_str.split(',') if s.strip()]
-        
         if excluded_services:
             print(f"Excluding services from analysis: {excluded_services}")
         
         # Set up time range for filtering using environment variable
         bedrock_client = get_bedrock_client()
         end_time = datetime.now(timezone.utc)
-        start_time = end_time - timedelta(days=analysis_window_days)
+        start_time = end_time - timedelta(days=ANALYSIS_WINDOW_DAYS)
         
         print(f"Fetching events between {start_time} and {end_time}")
         
@@ -822,7 +838,7 @@ def lambda_handler(event, context):
                 
                     # CHANGE 1: Fetch non-closed events (open and upcoming only)
                     non_closed_filter = {
-                        'startTime': {'from': formatted_start},
+                        'lastUpdatedTime': {'from': formatted_start, 'to': formatted_end},
                         'eventStatusCodes': ['open', 'upcoming']  # Only non-closed events
                     }
                     
@@ -862,7 +878,7 @@ def lambda_handler(event, context):
                     
                     # CHANGE 3: Same approach for account view - fetch non-closed events only
                     non_closed_filter = {
-                        'startTime': {'from': formatted_start},
+                        'lastUpdatedTime': {'from': formatted_start, 'to': formatted_end},
                         'eventStatusCodes': ['open', 'upcoming']  # Only non-closed events
                     }
                     
@@ -900,8 +916,7 @@ def lambda_handler(event, context):
                     
                     # CHANGE 5: Same approach for fallback - fetch closed events
                     closed_filter = {
-                        'startTime': {'from': formatted_start},
-                        'endTime': {'to': formatted_end},
+                        'lastUpdatedTime': {'from': formatted_start, 'to': formatted_end},
                         'eventStatusCodes': ['closed', 'upcoming']
                     }
                     
@@ -935,7 +950,7 @@ def lambda_handler(event, context):
                     
                     # CHANGE 6: Fetch open events with only start date filter
                     open_filter = {
-                        'startTime': {'from': formatted_start},  # Started on or after start date
+                        'lastUpdatedTime': {'from': formatted_start, 'to': formatted_end},  # Updated within date range
                         'eventStatusCodes': ['open']  # Only open events
                     }
                     
@@ -1380,10 +1395,10 @@ def analyze_event_with_bedrock(bedrock_client, event_data):
         """
         
         # Determine which model we're using and format accordingly
-        model_id = os.environ.get('BEDROCK_MODEL_ID', 'anthropic.claude-3-5-sonnet-20240620-v1:0')
-        max_tokens = int(os.environ.get('BEDROCK_MAX_TOKENS', '4000'))
-        temperature = float(os.environ.get('BEDROCK_TEMPERATURE', '0.2'))
-        top_p = float(os.environ.get('BEDROCK_TOP_P', '0.9'))
+        model_id = BEDROCK_MODEL_ID
+        max_tokens = BEDROCK_MAX_TOKENS
+        temperature = BEDROCK_TEMPERATURE
+        top_p = BEDROCK_TOP_P
         
         print(f"Sending request to Bedrock model: '{model_id}'")
         
@@ -2059,7 +2074,7 @@ def generate_summary_html(total_events, event_categories, filtered_events, categ
     
     # Add analysis window information
     end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(days=int(os.environ['ANALYSIS_WINDOW_DAYS']))
+    start_time = end_time - timedelta(days=ANALYSIS_WINDOW_DAYS)
     html_content += f"""
                 <p>Analysis Window: {start_time.strftime('%Y-%m-%d %H:%M:%S')} UTC to {end_time.strftime('%Y-%m-%d %H:%M:%S')} UTC</p>
     """
@@ -2408,16 +2423,23 @@ def send_ses_email_with_attachment_to_recipient_with_error_handling(html_content
         sender = os.environ['SENDER_EMAIL']
         recipients = [recipient_email.strip()]
         
+        # Get CC recipients for account-specific emails
+        cc_recipients = get_cc_recipients()
+        if cc_recipients:
+            print(f"CC recipients configured for account-specific emails: {', '.join(cc_recipients)}")
+        else:
+            print("No CC recipients configured for account-specific emails")
+        
         # Create email subject
         critical_count = event_categories.get('critical', 0)
         high_risk_count = sum(1 for event in events_analysis if event.get('risk_level', '').lower() == 'high')
         
         if critical_count > 0:
-            subject = f"{customer_name} [CRITICAL] AWS Health Events Analysis - {critical_count} Critical, {high_risk_count} High Risk Events"
+            subject = f"{CUSTOMER_NAME} [CRITICAL] AWS Health Events Analysis - {critical_count} Critical, {high_risk_count} High Risk Events"
         elif high_risk_count > 0:
-            subject = f"{customer_name} [HIGH RISK] AWS Health Events Analysis - {high_risk_count} High Risk Events"
+            subject = f"{CUSTOMER_NAME} [HIGH RISK] AWS Health Events Analysis - {high_risk_count} High Risk Events"
         else:
-            subject = f"{customer_name} AWS Health Events Analysis - {total_events} Events"
+            subject = f"{CUSTOMER_NAME} AWS Health Events Analysis - {total_events} Events"
         
         # Generate Excel filename
         current_date = datetime.now().strftime('%Y-%m-%d')
@@ -2428,9 +2450,12 @@ def send_ses_email_with_attachment_to_recipient_with_error_handling(html_content
         ses_client = boto3.client('ses')
         
         # Create raw email message with attachment
+        # Include CC recipients in destinations for SES
+        all_destinations = recipients + cc_recipients
+        
         msg_raw = {
             'Source': sender,
-            'Destinations': recipients,
+            'Destinations': all_destinations,
             'RawMessage': {
                 'Data': create_raw_email_with_attachment(
                     sender=sender,
@@ -2438,35 +2463,44 @@ def send_ses_email_with_attachment_to_recipient_with_error_handling(html_content
                     subject=subject,
                     html_body=html_content,
                     attachment_data=excel_buffer.getvalue(),
-                    attachment_name=excel_filename
+                    attachment_name=excel_filename,
+                    cc_recipients=cc_recipients if cc_recipients else None
                 )
             }
         }
         
-        # Check if recipient email is verified before sending (only in sandbox mode)
+        # Check if recipient and CC emails are verified before sending (only in sandbox mode)
         if should_verify_recipient_email():
-            print(f"SES is in sandbox mode - verifying recipient email: {recipient_email}")
+            all_emails_to_verify = [recipient_email] + cc_recipients
+            print(f"SES is in sandbox mode - verifying emails: {', '.join(all_emails_to_verify)}")
             try:
                 identity_response = ses_client.get_identity_verification_attributes(
-                    Identities=[recipient_email]
+                    Identities=all_emails_to_verify
                 )
                 
-                verification_status = identity_response.get('VerificationAttributes', {}).get(
-                    recipient_email, {}
-                ).get('VerificationStatus', 'NotStarted')
-                
-                if verification_status != 'Success':
-                    return False, f"Recipient email not verified (status: {verification_status})"
+                # Check each email
+                for email in all_emails_to_verify:
+                    verification_status = identity_response.get('VerificationAttributes', {}).get(
+                        email, {}
+                    ).get('VerificationStatus', 'NotStarted')
+                    
+                    if verification_status != 'Success':
+                        return False, f"Email not verified: {email} (status: {verification_status})"
                     
             except Exception as e:
-                print(f"Warning: Could not verify recipient status for {recipient_email}: {e}")
+                print(f"Warning: Could not verify email status: {e}")
                 # Continue with sending - this is just a warning, don't fail the send
         else:
-            print(f"SES is in production mode - skipping verification check for: {recipient_email}")
+            print(f"SES is in production mode - skipping verification check")
         
         # Send email with SES error handling
         response = ses_client.send_raw_email(**msg_raw)
-        print(f"Account-specific email sent successfully to {recipient_email}. Message ID: {response['MessageId']}")
+        
+        # Log success message with CC info if applicable
+        if cc_recipients:
+            print(f"Account-specific email sent successfully to {recipient_email} (CC: {', '.join(cc_recipients)}). Message ID: {response['MessageId']}")
+        else:
+            print(f"Account-specific email sent successfully to {recipient_email}. Message ID: {response['MessageId']}")
 
         # Upload to S3 if configured
         try:
@@ -2549,11 +2583,11 @@ def send_ses_email_with_attachment_master(html_content, excel_buffer, total_even
         high_risk_count = sum(1 for event in events_analysis if event.get('risk_level', '').lower() == 'high')
         
         if critical_count > 0:
-            subject = f"{customer_name} [MASTER] [CRITICAL] AWS Health Events Analysis - {critical_count} Critical, {high_risk_count} High Risk Events"
+            subject = f"{CUSTOMER_NAME} [MASTER] [CRITICAL] AWS Health Events Analysis - {critical_count} Critical, {high_risk_count} High Risk Events"
         elif high_risk_count > 0:
-            subject = f"{customer_name} [MASTER] [HIGH RISK] AWS Health Events Analysis - {high_risk_count} High Risk Events"
+            subject = f"{CUSTOMER_NAME} [MASTER] [HIGH RISK] AWS Health Events Analysis - {high_risk_count} High Risk Events"
         else:
-            subject = f"{customer_name} [MASTER] AWS Health Events Analysis - {total_events} Events"
+            subject = f"{CUSTOMER_NAME} [MASTER] AWS Health Events Analysis - {total_events} Events"
         
         # Generate Excel filename
         current_date = datetime.now().strftime('%Y-%m-%d')
@@ -3215,11 +3249,11 @@ def send_ses_email_with_attachment(html_content, excel_buffer, total_events, eve
         high_risk_count = sum(1 for event in events_analysis if event.get('risk_level', '').lower() == 'high')
         
         if critical_count > 0:
-            subject = f"{customer_name} [CRITICAL] AWS Health Events Analysis - {critical_count} Critical, {high_risk_count} High Risk Events"
+            subject = f"{CUSTOMER_NAME} [CRITICAL] AWS Health Events Analysis - {critical_count} Critical, {high_risk_count} High Risk Events"
         elif high_risk_count > 0:
-            subject = f"{customer_name} [HIGH RISK] AWS Health Events Analysis - {high_risk_count} High Risk Events"
+            subject = f"{CUSTOMER_NAME} [HIGH RISK] AWS Health Events Analysis - {high_risk_count} High Risk Events"
         else:
-            subject = f"{customer_name} AWS Health Events Analysis - {total_events} Events"
+            subject = f"{CUSTOMER_NAME} AWS Health Events Analysis - {total_events} Events"
         
         # Generate Excel filename
         current_date = datetime.now().strftime('%Y-%m-%d')
@@ -3329,7 +3363,7 @@ def send_ses_email_with_attachment(html_content, excel_buffer, total_events, eve
         print(error_message)
         return False, error_message
 
-def create_raw_email_with_attachment(sender, recipients, subject, html_body, attachment_data, attachment_name):
+def create_raw_email_with_attachment(sender, recipients, subject, html_body, attachment_data, attachment_name, cc_recipients=None):
     """
     Create raw email with attachment
     
@@ -3340,6 +3374,7 @@ def create_raw_email_with_attachment(sender, recipients, subject, html_body, att
         html_body (str): HTML email body
         attachment_data (bytes): Attachment data
         attachment_name (str): Attachment filename
+        cc_recipients (list, optional): List of CC recipient emails
         
     Returns:
         bytes: Raw email message
@@ -3353,6 +3388,10 @@ def create_raw_email_with_attachment(sender, recipients, subject, html_body, att
     msg['Subject'] = subject
     msg['From'] = sender
     msg['To'] = ', '.join(recipients)
+    
+    # Add CC header if CC recipients are provided
+    if cc_recipients:
+        msg['Cc'] = ', '.join(cc_recipients)
     
     # Create HTML part
     msg_body = MIMEMultipart('alternative')

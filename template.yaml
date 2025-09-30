@@ -18,6 +18,11 @@ Parameters:
     Type: String
     Description: Comma-separated list of email addresses to receive reports
     
+  RecipientCcEmails:
+    Type: String
+    Description: (Optional) Comma-separated list of email addresses to CC on account-specific emails only
+    Default: ''
+    
   EventCategories:
     Type: String
     Description: (Optional) Comma-separated list of event categories to filter
@@ -249,6 +254,7 @@ Resources:
           ANALYSIS_WINDOW_DAYS: !Ref AnalysisWindowDays
           SENDER_EMAIL: !Ref SenderEmail
           RECIPIENT_EMAILS: !Ref RecipientEmails
+          RECIPIENT_CC_EMAILS: !Ref RecipientCcEmails
           EVENT_CATEGORIES: !Ref EventCategories
           EXCEL_FILENAME_TEMPLATE: !Ref ExcelFilenameTemplate
           REPORTS_BUCKET: !Ref ReportsBucket
